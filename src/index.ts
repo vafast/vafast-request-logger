@@ -27,6 +27,7 @@ export interface RequestLog {
   status: number
   duration: number
   userId?: string
+  appId?: string
   createdAt: Date
 }
 
@@ -58,6 +59,8 @@ export interface RequestLoggerConfig {
   sanitize?: SanitizeConfig
   /** 获取用户 ID 的函数 */
   getUserId?: (req: Request) => string | undefined
+  /** 获取应用 ID 的函数（用于多租户） */
+  getAppId?: (req: Request) => string | undefined
   /** 错误回调 */
   onError?: (error: Error) => void
   /** 是否启用 @default true */
@@ -89,6 +92,7 @@ export function createRequestLogger(config: RequestLoggerConfig): Middleware {
     excludePaths = [],
     sanitize: sanitizeConfig,
     getUserId,
+    getAppId,
     onError = console.error,
     enabled = true,
   } = config
@@ -107,6 +111,7 @@ export function createRequestLogger(config: RequestLoggerConfig): Middleware {
       excludePaths,
       sanitizeConfig,
       getUserId,
+      getAppId,
       onError,
     }).catch(onError)
 
@@ -121,6 +126,7 @@ interface RecordLogOptions {
   excludePaths: (string | RegExp)[]
   sanitizeConfig?: SanitizeConfig
   getUserId?: (req: Request) => string | undefined
+  getAppId?: (req: Request) => string | undefined
   onError: (error: Error) => void
 }
 
@@ -130,7 +136,7 @@ async function recordLog(
   startTime: number,
   options: RecordLogOptions
 ) {
-  const { storage, excludePaths, sanitizeConfig, getUserId } = options
+  const { storage, excludePaths, sanitizeConfig, getUserId, getAppId } = options
 
   const url = new URL(req.url)
   const path = url.pathname
@@ -182,8 +188,9 @@ async function recordLog(
   const now = new Date()
   const duration = Date.now() - startTime
 
-  // 获取用户 ID
+  // 获取用户 ID 和应用 ID
   const userId = getUserId?.(req)
+  const appId = getAppId?.(req)
 
   // 存储请求日志
   const requestLogId = await storage.saveRequestLog({
@@ -201,6 +208,7 @@ async function recordLog(
     status: response.status,
     duration,
     userId,
+    appId,
     createdAt: now,
   })
 
