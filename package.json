@@ -28,7 +28,7 @@
     "test": "bun test",
     "test:types": "tsc --noEmit",
     "prepublishOnly": "npm run build",
-    "release": "npm run build && npm publish --access=public"
+    "release": "npx np --no-tests"
   },
   "license": "MIT",
   "files": [
