@@ -22,13 +22,10 @@
     "typescript"
   ],
   "scripts": {
-    "clean": "rimraf dist",
     "build": "tsup",
-    "dev": "bun run --hot example/index.ts",
+    "dev": "bun run --watch example/index.ts",
     "test": "bun test",
-    "test:types": "tsc --noEmit",
-    "prepublishOnly": "npm run build",
-    "release": "npx np --no-tests"
+    "release": "npx np"
   },
   "license": "MIT",
   "files": [
