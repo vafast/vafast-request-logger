@@ -1,0 +1,58 @@
+{
+  "name": "@vafast/request-logger",
+  "version": "0.1.0",
+  "description": "API request logging middleware for Vafast with sensitive data sanitization",
+  "type": "module",
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    }
+  },
+  "keywords": [
+    "vafast",
+    "request-logger",
+    "api-logs",
+    "middleware",
+    "mongodb",
+    "typescript"
+  ],
+  "scripts": {
+    "clean": "rimraf dist",
+    "build": "tsup",
+    "dev": "bun run --hot example/index.ts",
+    "test": "bun test",
+    "test:types": "tsc --noEmit",
+    "prepublishOnly": "npm run build",
+    "release": "npm run build && npm publish --access=public"
+  },
+  "license": "MIT",
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "dependencies": {},
+  "devDependencies": {
+    "@types/node": "^22.15.30",
+    "mongodb": "^6.16.0",
+    "rimraf": "^6.0.1",
+    "tsup": "^8.5.1",
+    "typescript": "^5.4.5",
+    "vafast": "^0.3.9"
+  },
+  "peerDependencies": {
+    "vafast": ">= 0.3.0",
+    "mongodb": ">= 6.0.0"
+  },
+  "peerDependenciesMeta": {
+    "mongodb": {
+      "optional": true
+    }
+  }
+}
+
