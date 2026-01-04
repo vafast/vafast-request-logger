@@ -28,6 +28,8 @@ export interface RequestLog {
   duration: number
   userId?: string
   appId?: string
+  /** 服务标识（区分不同服务，如 auth-server、ones-server） */
+  service?: string
   createdAt: Date
 }
 
@@ -61,6 +63,8 @@ export interface RequestLoggerConfig {
   getUserId?: (req: Request) => string | undefined
   /** 获取应用 ID 的函数（用于多租户） */
   getAppId?: (req: Request) => string | undefined
+  /** 服务标识（区分不同服务，如 auth-server、ones-server） */
+  service?: string
   /** 错误回调 */
   onError?: (error: Error) => void
   /** 是否启用 @default true */
@@ -93,6 +97,7 @@ export function createRequestLogger(config: RequestLoggerConfig): Middleware {
     sanitize: sanitizeConfig,
     getUserId,
     getAppId,
+    service,
     onError = console.error,
     enabled = true,
   } = config
@@ -112,6 +117,7 @@ export function createRequestLogger(config: RequestLoggerConfig): Middleware {
       sanitizeConfig,
       getUserId,
       getAppId,
+      service,
       onError,
     }).catch(onError)
 
@@ -127,6 +133,7 @@ interface RecordLogOptions {
   sanitizeConfig?: SanitizeConfig
   getUserId?: (req: Request) => string | undefined
   getAppId?: (req: Request) => string | undefined
+  service?: string
   onError: (error: Error) => void
 }
 
@@ -136,7 +143,7 @@ async function recordLog(
   startTime: number,
   options: RecordLogOptions
 ) {
-  const { storage, excludePaths, sanitizeConfig, getUserId, getAppId } = options
+  const { storage, excludePaths, sanitizeConfig, getUserId, getAppId, service } = options
 
   const url = new URL(req.url)
   const path = url.pathname
@@ -209,6 +216,7 @@ async function recordLog(
     duration,
     userId,
     appId,
+    service,
     createdAt: now,
   })
 
