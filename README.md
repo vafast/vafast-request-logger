@@ -16,7 +16,7 @@ API request logging middleware for Vafast with automatic sensitive data sanitiza
 ```bash
 npm install @vafast/request-logger
 # or
-bun add @vafast/request-logger
+npm install @vafast/request-logger
 ```
 
 ## Quick Start
