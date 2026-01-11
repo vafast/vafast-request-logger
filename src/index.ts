@@ -5,9 +5,13 @@
  * - Automatic sensitive data sanitization
  * - Pluggable storage adapters (MongoDB, custom)
  * - Async logging (non-blocking)
- * - Path exclusion support
+ * - Route-level log control (log: false in route definition, supports inheritance)
+ * 
+ * Uses vafast RouteRegistry to query route configurations at runtime,
+ * similar to @vafast/webhook implementation.
  */
 import type { Middleware } from 'vafast'
+import { getRoute } from 'vafast'
 import { sanitize, sanitizeHeaders, type SanitizeConfig } from './sanitize'
 
 // ============ Types ============
@@ -55,8 +59,6 @@ export interface StorageAdapter {
 export interface RequestLoggerConfig {
   /** 存储适配器 */
   storage: StorageAdapter
-  /** 排除的路径（支持字符串或正则） */
-  excludePaths?: (string | RegExp)[]
   /** 敏感数据清洗配置 */
   sanitize?: SanitizeConfig
   /** 获取用户 ID 的函数 */
@@ -76,6 +78,8 @@ export interface RequestLoggerConfig {
 /**
  * 创建请求日志中间件
  * 
+ * 日志排除：在路由定义中设置 log: false，支持嵌套继承（父路由设置会自动继承给子路由）
+ * 
  * @example
  * ```typescript
  * import { createRequestLogger, createMongoAdapter } from '@vafast/request-logger'
@@ -83,17 +87,31 @@ export interface RequestLoggerConfig {
  * 
  * const requestLogger = createRequestLogger({
  *   storage: createMongoAdapter(mongoDb, 'logs', 'logsResponse'),
- *   excludePaths: ['/health', '/metrics'],
  *   getUserId: (req) => getLocals(req)?.userInfo?.id,
  * })
  * 
  * server.use(requestLogger)
  * ```
+ * 
+ * 在路由定义中使用 log: false（支持嵌套继承）：
+ * ```typescript
+ * // 单个路由
+ * { method: 'GET', path: '/health', log: false, handler: ... }
+ * 
+ * // 父路由设置，所有子路由继承
+ * {
+ *   path: '/logs',
+ *   log: false,  // 所有子路由都不记录日志
+ *   children: [
+ *     { method: 'POST', path: '/find', handler: ... },
+ *     { method: 'POST', path: '/search', handler: ... },
+ *   ]
+ * }
+ * ```
  */
 export function createRequestLogger(config: RequestLoggerConfig): Middleware {
   const {
     storage,
-    excludePaths = [],
     sanitize: sanitizeConfig,
     getUserId,
     getAppId,
@@ -113,7 +131,6 @@ export function createRequestLogger(config: RequestLoggerConfig): Middleware {
     // 异步记录日志，不阻塞响应
     recordLog(req, response, startTime, {
       storage,
-      excludePaths,
       sanitizeConfig,
       getUserId,
       getAppId,
@@ -129,12 +146,26 @@ export function createRequestLogger(config: RequestLoggerConfig): Middleware {
 
 interface RecordLogOptions {
   storage: StorageAdapter
-  excludePaths: (string | RegExp)[]
   sanitizeConfig?: SanitizeConfig
   getUserId?: (req: Request) => string | undefined
   getAppId?: (req: Request) => string | undefined
   service?: string
   onError: (error: Error) => void
+}
+
+/**
+ * 检查路由是否配置了 log: false
+ * 使用 vafast RouteRegistry 查询路由配置（支持嵌套继承）
+ */
+function shouldSkipLog(method: string, path: string): boolean {
+  try {
+    // RouteRegistry 使用完整路径 (fullPath) 作为 key，直接查询
+    const route = getRoute<{ log?: boolean }>(method, path)
+    return route?.log === false
+  } catch {
+    // RouteRegistry 未初始化时忽略错误
+    return false
+  }
 }
 
 async function recordLog(
@@ -143,20 +174,13 @@ async function recordLog(
   startTime: number,
   options: RecordLogOptions
 ) {
-  const { storage, excludePaths, sanitizeConfig, getUserId, getAppId, service } = options
+  const { storage, sanitizeConfig, getUserId, getAppId, service } = options
 
   const url = new URL(req.url)
   const path = url.pathname
 
-  // 检查是否需要排除
-  const shouldExclude = excludePaths.some(pattern => {
-    if (typeof pattern === 'string') {
-      return path.includes(pattern)
-    }
-    return pattern.test(path)
-  })
-
-  if (shouldExclude) {
+  // 检查路由定义中的 log: false（通过 RouteRegistry 查询，支持嵌套继承）
+  if (shouldSkipLog(req.method, path)) {
     return
   }
 
