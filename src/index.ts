@@ -32,6 +32,8 @@ export interface RequestLog {
   duration: number
   userId?: string
   appId?: string
+  /** 认证类型（由调用方定义，如 apiKey、jwt 等） */
+  authType?: string
   /** 服务标识（区分不同服务，如 auth-server、ones-server） */
   service?: string
   createdAt: Date
@@ -65,6 +67,8 @@ export interface RequestLoggerConfig {
   getUserId?: (req: Request) => string | undefined
   /** 获取应用 ID 的函数（用于多租户） */
   getAppId?: (req: Request) => string | undefined
+  /** 获取认证类型的函数（如 apiKey、jwt 等） */
+  getAuthType?: (req: Request) => string | undefined
   /** 服务标识（区分不同服务，如 auth-server、ones-server） */
   service?: string
   /** 错误回调 */
@@ -115,6 +119,7 @@ export function createRequestLogger(config: RequestLoggerConfig): Middleware {
     sanitize: sanitizeConfig,
     getUserId,
     getAppId,
+    getAuthType,
     service,
     onError = console.error,
     enabled = true,
@@ -134,6 +139,7 @@ export function createRequestLogger(config: RequestLoggerConfig): Middleware {
       sanitizeConfig,
       getUserId,
       getAppId,
+      getAuthType,
       service,
       onError,
     }).catch(onError)
@@ -149,6 +155,7 @@ interface RecordLogOptions {
   sanitizeConfig?: SanitizeConfig
   getUserId?: (req: Request) => string | undefined
   getAppId?: (req: Request) => string | undefined
+  getAuthType?: (req: Request) => string | undefined
   service?: string
   onError: (error: Error) => void
 }
@@ -174,7 +181,7 @@ async function recordLog(
   startTime: number,
   options: RecordLogOptions
 ) {
-  const { storage, sanitizeConfig, getUserId, getAppId, service } = options
+  const { storage, sanitizeConfig, getUserId, getAppId, getAuthType, service } = options
 
   const url = new URL(req.url)
   const path = url.pathname
@@ -219,9 +226,10 @@ async function recordLog(
   const now = new Date()
   const duration = Date.now() - startTime
 
-  // 获取用户 ID 和应用 ID
+  // 获取用户 ID、应用 ID 和认证类型
   const userId = getUserId?.(req)
   const appId = getAppId?.(req)
+  const authType = getAuthType?.(req)
 
   // 存储请求日志
   const requestLogId = await storage.saveRequestLog({
@@ -240,6 +248,7 @@ async function recordLog(
     duration,
     userId,
     appId,
+    authType,
     service,
     createdAt: now,
   })
