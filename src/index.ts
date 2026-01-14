@@ -10,7 +10,7 @@
  * Uses vafast RouteRegistry to query route configurations at runtime,
  * similar to @vafast/webhook implementation.
  */
-import type { Middleware } from 'vafast'
+import { defineMiddleware } from 'vafast'
 import { getRoute } from 'vafast'
 import { sanitize, sanitizeHeaders, type SanitizeConfig } from './sanitize'
 
@@ -91,7 +91,7 @@ export interface RequestLoggerConfig {
  * 
  * const requestLogger = createRequestLogger({
  *   storage: createMongoAdapter(mongoDb, 'logs', 'logsResponse'),
- *   getUserId: (req) => getLocals(req)?.userInfo?.id,
+ *   getUserId: (req) => (req as any).__locals?.userInfo?.id,
  * })
  * 
  * server.use(requestLogger)
@@ -113,7 +113,7 @@ export interface RequestLoggerConfig {
  * }
  * ```
  */
-export function createRequestLogger(config: RequestLoggerConfig): Middleware {
+export function createRequestLogger(config: RequestLoggerConfig) {
   const {
     storage,
     sanitize: sanitizeConfig,
@@ -125,7 +125,7 @@ export function createRequestLogger(config: RequestLoggerConfig): Middleware {
     enabled = true,
   } = config
 
-  return async (req: Request, next: () => Promise<Response>) => {
+  return defineMiddleware(async (req, next) => {
     if (!enabled) {
       return next()
     }
@@ -145,7 +145,7 @@ export function createRequestLogger(config: RequestLoggerConfig): Middleware {
     }).catch(onError)
 
     return response
-  }
+  })
 }
 
 // ============ Internal Functions ============
@@ -330,4 +330,3 @@ export function createConsoleAdapter(): StorageAdapter {
 
 export { sanitize, sanitizeHeaders, type SanitizeConfig } from './sanitize'
 export default createRequestLogger
-
