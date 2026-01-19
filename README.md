@@ -1,249 +1,116 @@
 # @vafast/request-logger
 
-API request logging middleware for Vafast with automatic sensitive data sanitization.
+API 请求日志中间件，将日志提交到远程日志服务。
 
-## Features
-
-- 📝 Automatic API request/response logging
-- 🔒 Built-in sensitive data sanitization (passwords, tokens, etc.)
-- 🔌 Pluggable storage adapters (MongoDB, HTTP, Console, Custom)
-- 🌐 HTTP adapter for microservices architecture
-- ⚡ Non-blocking async logging
-- 🚫 Path exclusion support
-- 📊 Request duration tracking
-
-## Installation
+## 安装
 
 ```bash
 npm install @vafast/request-logger
-# or
-npm install @vafast/request-logger
 ```
 
-## Quick Start
-
-### With MongoDB
+## 使用
 
 ```typescript
-import { Server } from 'vafast'
-import { createRequestLogger, createMongoAdapter } from '@vafast/request-logger'
-import { mongoDb } from './mongodb'
+import { requestLogger } from '@vafast/request-logger'
 
-const server = new Server(routes)
-
-// Create request logger middleware
-const requestLogger = createRequestLogger({
-  storage: createMongoAdapter(mongoDb, 'logs', 'logsResponse'),
-  excludePaths: ['/health', '/metrics', '/performance/add'],
-  getUserId: (req) => {
-    const locals = getLocals(req)
-    return locals?.userInfo?.id
-  },
-})
-
-server.use(requestLogger)
+server.use(requestLogger({
+  url: 'http://log-server:9005/api/logs/ingest',
+  service: 'my-service',
+  headers: { Authorization: 'Bearer apiKeyId:apiKeySecret' },
+  onError: (err) => console.error('日志记录失败', err),
+}))
 ```
 
-### With HTTP (Microservices)
+业务字段（appId、authType、ip、traceId 等）由日志服务端从 headers 自动解析。
+
+## 配置
+
+| 参数 | 类型 | 必填 | 默认值 | 说明 |
+|------|------|------|--------|------|
+| `url` | `string` | 是 | - | 日志服务 URL |
+| `service` | `string` | 是 | - | 服务标识 |
+| `headers` | `Record<string, string>` | 否 | `{}` | 自定义请求头（如认证） |
+| `timeout` | `number` | 否 | `5000` | 超时时间（毫秒） |
+| `sanitize` | `SanitizeConfig` | 否 | - | 敏感数据清洗配置 |
+| `onError` | `(err) => void` | 否 | `console.error` | 错误回调 |
+| `enabled` | `boolean` | 否 | `true` | 是否启用 |
+
+## 路由级别控制
+
+在路由定义中设置 `log: false` 跳过日志记录：
 
 ```typescript
-import { createRequestLogger, createHttpAdapter } from '@vafast/request-logger'
+// 单个路由
+{ method: 'GET', path: '/health', log: false, handler: ... }
 
-const requestLogger = createRequestLogger({
-  storage: createHttpAdapter({
-    url: 'http://log-server:9005/api/logs/ingest',
-    headers: {
-      'Authorization': 'Bearer your-api-key',
-    },
-  }),
-  service: 'auth-server',
-})
-```
-
-### Development (Console)
-
-```typescript
-import { createRequestLogger, createConsoleAdapter } from '@vafast/request-logger'
-
-const requestLogger = createRequestLogger({
-  storage: createConsoleAdapter(),
-})
-```
-
-## Sensitive Data Sanitization
-
-The middleware automatically sanitizes sensitive data before logging:
-
-| Original | Sanitized |
-|----------|-----------|
-| `{ password: "abc123" }` | `{ password: "[REDACTED]" }` |
-| `Authorization: "Bearer eyJhbG..."` | `Authorization: "Bearer eyJh****bG..."` |
-| `Cookie: "session=xxx"` | `Cookie: "[REDACTED]"` |
-| `{ apiKey: "sk-1234567890abcdef" }` | `{ apiKey: "sk-1****cdef" }` |
-
-### Default Removed Fields
-
-- `password`, `newPassword`, `oldPassword`
-- `secret`, `secretKey`, `privateKey`
-- `apiSecret`, `clientSecret`
-
-### Default Masked Fields (partial)
-
-- `token`, `accessToken`, `refreshToken`
-- `authorization`, `apiKey`, `bearer`
-
-### Custom Sanitization
-
-```typescript
-const requestLogger = createRequestLogger({
-  storage: adapter,
-  sanitize: {
-    removeFields: ['password', 'ssn', 'creditCard'],
-    maskFields: ['token', 'apiKey', 'phoneNumber'],
-    placeholder: '***HIDDEN***',
-  },
-})
-```
-
-## Configuration
-
-```typescript
-interface RequestLoggerConfig {
-  /** Storage adapter (required) */
-  storage: StorageAdapter
-  /** Paths to exclude from logging */
-  excludePaths?: (string | RegExp)[]
-  /** Sanitization config */
-  sanitize?: SanitizeConfig
-  /** Function to get user ID from request */
-  getUserId?: (req: Request) => string | undefined
-  /** Error callback */
-  onError?: (error: Error) => void
-  /** Enable/disable logging @default true */
-  enabled?: boolean
-}
-```
-
-## HTTP Adapter Configuration
-
-For microservices architecture, use `createHttpAdapter` to send logs to a remote log service.
-
-**Features:**
-- Single HTTP request per log (request + response combined)
-- Server-side splits data into separate collections
-- Reduced network overhead
-
-```typescript
-import { createHttpAdapter } from '@vafast/request-logger'
-
-const adapter = createHttpAdapter({
-  // Required: API endpoint
-  url: 'http://log-server/api/logs/ingest',
-  
-  // Optional: Custom headers (authentication, etc.)
-  headers: {
-    'Authorization': 'Bearer ak_xxx:sk_xxx',
-  },
-  
-  // Optional: Timeout in milliseconds (default: 5000)
-  timeout: 5000,
-  
-  // Optional: Custom field mapping
-  mapLog: (log) => ({
-    ...log.request,
-    responseData: log.response.data,
-    timestamp: log.request.createdAt.toISOString(),
-  }),
-  
-  // Optional: Error callback
-  onError: (error) => console.error('Log failed:', error),
-})
-```
-
-### HTTP Adapter Config Reference
-
-| Option | Type | Required | Default | Description |
-|--------|------|----------|---------|-------------|
-| `url` | `string` | ✅ | - | Log API endpoint |
-| `headers` | `Record<string, string>` | ❌ | `{}` | Custom HTTP headers |
-| `timeout` | `number` | ❌ | `5000` | Request timeout (ms) |
-| `mapLog` | `(log: LogData) => object` | ❌ | Built-in | Field mapping function |
-| `onError` | `(error) => void` | ❌ | - | Error callback |
-
-### Expected Request Body
-
-The adapter sends a combined log with this default structure:
-
-```json
+// 父路由设置，子路由继承
 {
-  "method": "POST",
-  "url": "http://example.com/api/users",
-  "path": "/api/users",
-  "headers": {},
-  "body": {},
-  "query": {},
-  "status": 200,
-  "duration": 15,
-  "userId": "123",
-  "appId": "app_1",
-  "authType": "jwt",
-  "service": "auth-server",
-  "createdAt": "2024-01-01T00:00:00.000Z",
-  "response": { "success": true, "message": "OK", "code": 0 },
-  "responseData": { /* full response data */ }
+  path: '/internal',
+  log: false,
+  children: [
+    { method: 'GET', path: '/metrics', handler: ... },
+    { method: 'GET', path: '/status', handler: ... },
+  ]
 }
 ```
 
-The server should split and store:
-- Main fields → `logs` collection
-- `responseData` → `logsResponse` collection (with reference to log ID)
+## 日志数据格式
 
-## Custom Storage Adapter
+发送到日志服务的数据结构：
 
 ```typescript
-import type { StorageAdapter, LogData } from '@vafast/request-logger'
-
-const myAdapter: StorageAdapter = {
-  async saveLog(log: LogData) {
-    // log.request - 请求信息
-    // log.response - 响应信息（包含 data）
-    await myDb.insert('logs', {
-      ...log.request,
-      response: log.response,
-    })
-  },
-}
-```
-
-## Log Structure
-
-```typescript
-interface LogData {
-  request: {
-    method: 'POST',
-    url: 'http://localhost:3000/api/users',
-    path: '/api/users',
-    headers: { /* sanitized */ },
-    body: { /* sanitized */ },
-    query: {},
-    status: 200,
-    duration: 15,
-    userId: '123',
-    appId: 'app_1',
-    authType: 'jwt',
-    service: 'auth-server',
-    createdAt: Date,
-  },
+{
+  method: 'POST',
+  url: 'http://example.com/api/users?page=1',
+  path: '/api/users',
+  headers: { ... },
+  body: { ... },
+  query: { page: '1' },
+  status: 200,
+  duration: 50,
+  service: 'my-service',
+  userId: 'user123',
+  appId: 'app456',
+  authType: 'jwt',
+  ip: '192.168.1.1',
+  userAgent: 'Mozilla/5.0...',
+  traceId: 'trace789',
+  createdAt: '2024-01-01T00:00:00.000Z',
   response: {
     success: true,
     message: 'OK',
     code: 0,
-    data: { /* sanitized response data */ },
   },
+  responseData: { ... },
 }
 ```
 
-## License
+## 敏感数据脱敏
 
-MIT
+默认自动脱敏以下字段：
 
+- `password`, `pwd`, `secret`, `token`
+- `authorization`, `cookie`, `x-api-key`
+- `accessToken`, `refreshToken`, `apiKey`
+
+自定义脱敏配置：
+
+```typescript
+requestLogger({
+  url: '...',
+  service: '...',
+  sanitize: {
+    fields: ['password', 'creditCard', 'ssn'],
+    mask: '******',
+    deep: true,
+  },
+})
+```
+
+## 特性
+
+- 异步非阻塞（不影响响应速度）
+- 自动敏感数据脱敏
+- 路由级别日志控制
+- 支持多租户（appId）
+- 支持分布式追踪（traceId）

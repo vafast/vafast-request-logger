@@ -1,232 +1,135 @@
-import { describe, it, expect, vi } from 'vitest'
-import { createConsoleAdapter, createMongoAdapter, type StorageAdapter } from './index'
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
+import { requestLogger, type RequestLoggerOptions } from './index'
 
-describe('createConsoleAdapter', () => {
-  it('应该创建一个有效的存储适配器', () => {
-    const adapter = createConsoleAdapter()
-    expect(adapter).toBeDefined()
-    expect(typeof adapter.saveRequestLog).toBe('function')
-    expect(typeof adapter.saveResponseLog).toBe('function')
+describe('requestLogger', () => {
+  let fetchMock: ReturnType<typeof vi.fn>
+
+  beforeEach(() => {
+    fetchMock = vi.fn().mockResolvedValue({ ok: true })
+    vi.stubGlobal('fetch', fetchMock)
   })
 
-  it('saveRequestLog 应该返回递增的 ID', async () => {
-    const adapter = createConsoleAdapter()
-
-    const log1 = {
-      method: 'GET',
-      url: 'http://example.com/api/test',
-      path: '/api/test',
-      headers: {},
-      body: null,
-      query: {},
-      response: { success: true },
-      status: 200,
-      duration: 100,
-      createdAt: new Date(),
-    }
-
-    const id1 = await adapter.saveRequestLog(log1)
-    const id2 = await adapter.saveRequestLog(log1)
-
-    expect(id1).toBe('log_1')
-    expect(id2).toBe('log_2')
+  afterEach(() => {
+    vi.unstubAllGlobals()
   })
 
-  it('saveRequestLog 应该打印日志信息', async () => {
-    const consoleSpy = vi.spyOn(console, 'log').mockImplementation(() => {})
-    const adapter = createConsoleAdapter()
+  it('应该创建中间件函数', () => {
+    const middleware = requestLogger({
+      url: 'http://log-server/api/logs',
+      service: 'test-service',
+    })
+    expect(middleware).toBeDefined()
+    expect(typeof middleware).toBe('function')
+  })
 
-    await adapter.saveRequestLog({
-      method: 'POST',
-      url: 'http://example.com/api/users',
-      path: '/api/users',
-      headers: {},
-      body: { name: 'test' },
-      query: {},
-      response: { success: true },
-      status: 201,
-      duration: 50,
-      createdAt: new Date(),
+  it('应该调用 next 并返回响应', async () => {
+    const middleware = requestLogger({
+      url: 'http://log-server/api/logs',
+      service: 'test-service',
     })
 
-    expect(consoleSpy).toHaveBeenCalledWith(
-      '[REQUEST] POST /api/users 201 50ms'
+    const mockResponse = new Response(JSON.stringify({ success: true }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    })
+    const mockNext = vi.fn().mockResolvedValue(mockResponse)
+    const mockReq = new Request('http://example.com/api/test', {
+      method: 'GET',
+    })
+
+    const result = await middleware(mockReq, mockNext)
+
+    expect(mockNext).toHaveBeenCalled()
+    expect(result).toBe(mockResponse)
+  })
+
+  it('enabled=false 时应该跳过日志记录', async () => {
+    const middleware = requestLogger({
+      url: 'http://log-server/api/logs',
+      service: 'test-service',
+      enabled: false,
+    })
+
+    const mockResponse = new Response('{}')
+    const mockNext = vi.fn().mockResolvedValue(mockResponse)
+    const mockReq = new Request('http://example.com/api/test')
+
+    await middleware(mockReq, mockNext)
+
+    // 等待异步操作
+    await new Promise((r) => setTimeout(r, 10))
+
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+
+  it('应该发送正确的日志数据到日志服务', async () => {
+    const middleware = requestLogger({
+      url: 'http://log-server/api/logs',
+      service: 'test-service',
+      headers: { Authorization: 'Bearer key:secret' },
+    })
+
+    const mockResponse = new Response(
+      JSON.stringify({ success: true, message: 'OK' }),
+      { status: 200, headers: { 'Content-Type': 'application/json' } }
     )
-
-    consoleSpy.mockRestore()
-  })
-
-  it('saveResponseLog 应该在失败时打印错误信息', async () => {
-    const consoleSpy = vi.spyOn(console, 'log').mockImplementation(() => {})
-    const adapter = createConsoleAdapter()
-
-    await adapter.saveResponseLog({
-      requestLogId: 'log_1',
-      success: false,
-      message: 'User not found',
-      createdAt: new Date(),
-    })
-
-    expect(consoleSpy).toHaveBeenCalledWith('[RESPONSE ERROR] User not found')
-
-    consoleSpy.mockRestore()
-  })
-
-  it('saveResponseLog 成功时不应该打印', async () => {
-    const consoleSpy = vi.spyOn(console, 'log').mockImplementation(() => {})
-    const adapter = createConsoleAdapter()
-
-    await adapter.saveResponseLog({
-      requestLogId: 'log_1',
-      success: true,
-      message: 'OK',
-      createdAt: new Date(),
-    })
-
-    expect(consoleSpy).not.toHaveBeenCalled()
-
-    consoleSpy.mockRestore()
-  })
-})
-
-describe('createMongoAdapter', () => {
-  it('应该创建一个有效的存储适配器', () => {
-    const mockDb = {
-      collection: vi.fn().mockReturnValue({
-        insertOne: vi.fn(),
-      }),
-    }
-
-    const adapter = createMongoAdapter(mockDb)
-    expect(adapter).toBeDefined()
-    expect(typeof adapter.saveRequestLog).toBe('function')
-    expect(typeof adapter.saveResponseLog).toBe('function')
-  })
-
-  it('saveRequestLog 应该调用正确的 collection 和返回 ID', async () => {
-    const mockInsertOne = vi.fn().mockResolvedValue({
-      insertedId: { toHexString: () => '507f1f77bcf86cd799439011' },
-    })
-    const mockCollection = vi.fn().mockReturnValue({
-      insertOne: mockInsertOne,
-    })
-    const mockDb = { collection: mockCollection }
-
-    const adapter = createMongoAdapter(mockDb, 'myLogs', 'myLogsResponse')
-
-    const log = {
-      method: 'GET',
-      url: 'http://example.com/api/test',
-      path: '/api/test',
-      headers: {},
-      body: null,
-      query: {},
-      response: { success: true },
-      status: 200,
-      duration: 100,
-      createdAt: new Date(),
-    }
-
-    const id = await adapter.saveRequestLog(log)
-
-    expect(mockCollection).toHaveBeenCalledWith('myLogs')
-    expect(mockInsertOne).toHaveBeenCalled()
-    expect(id).toBe('507f1f77bcf86cd799439011')
-  })
-
-  it('saveResponseLog 应该调用正确的 collection', async () => {
-    const mockInsertOne = vi.fn().mockResolvedValue({ insertedId: {} })
-    const mockCollection = vi.fn().mockReturnValue({
-      insertOne: mockInsertOne,
-    })
-    const mockDb = { collection: mockCollection }
-
-    const adapter = createMongoAdapter(mockDb, 'logs', 'logsResponse')
-
-    await adapter.saveResponseLog({
-      requestLogId: '507f1f77bcf86cd799439011',
-      success: true,
-      message: 'OK',
-      createdAt: new Date(),
-    })
-
-    expect(mockCollection).toHaveBeenCalledWith('logsResponse')
-    expect(mockInsertOne).toHaveBeenCalled()
-  })
-
-  it('应该使用默认 collection 名称', async () => {
-    const mockInsertOne = vi.fn().mockResolvedValue({
-      insertedId: { toHexString: () => 'id' },
-    })
-    const mockCollection = vi.fn().mockReturnValue({
-      insertOne: mockInsertOne,
-    })
-    const mockDb = { collection: mockCollection }
-
-    const adapter = createMongoAdapter(mockDb)
-
-    await adapter.saveRequestLog({
-      method: 'GET',
-      url: 'http://example.com',
-      path: '/',
-      headers: {},
-      body: null,
-      query: {},
-      response: {},
-      status: 200,
-      duration: 10,
-      createdAt: new Date(),
-    })
-
-    await adapter.saveResponseLog({
-      requestLogId: 'id',
-      createdAt: new Date(),
-    })
-
-    // 验证使用了默认 collection 名称
-    expect(mockCollection).toHaveBeenCalledWith('logs')
-    expect(mockCollection).toHaveBeenCalledWith('logsResponse')
-  })
-})
-
-describe('StorageAdapter 接口', () => {
-  it('应该可以实现自定义存储适配器', async () => {
-    const logs: unknown[] = []
-
-    const customAdapter: StorageAdapter = {
-      async saveRequestLog(log) {
-        const id = `custom_${logs.length + 1}`
-        logs.push({ id, type: 'request', ...log })
-        return id
+    const mockNext = vi.fn().mockResolvedValue(mockResponse)
+    const mockReq = new Request('http://example.com/api/users?page=1', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'User-Agent': 'Test Browser',
+        'app-id': 'app123',
       },
-      async saveResponseLog(log) {
-        logs.push({ type: 'response', ...log })
-      },
-    }
-
-    const id = await customAdapter.saveRequestLog({
-      method: 'GET',
-      url: 'http://example.com',
-      path: '/',
-      headers: {},
-      body: null,
-      query: {},
-      response: {},
-      status: 200,
-      duration: 10,
-      createdAt: new Date(),
+      body: JSON.stringify({ name: 'test' }),
     })
 
-    expect(id).toBe('custom_1')
-    expect(logs.length).toBe(1)
+    await middleware(mockReq, mockNext)
 
-    await customAdapter.saveResponseLog({
-      requestLogId: id,
-      success: true,
-      createdAt: new Date(),
+    // 等待异步操作
+    await new Promise((r) => setTimeout(r, 50))
+
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+
+    const [url, options] = fetchMock.mock.calls[0]
+    expect(url).toBe('http://log-server/api/logs')
+    expect(options.method).toBe('POST')
+    expect(options.headers).toMatchObject({
+      'Content-Type': 'application/json',
+      Authorization: 'Bearer key:secret',
     })
 
-    expect(logs.length).toBe(2)
+    const body = JSON.parse(options.body)
+    expect(body.method).toBe('POST')
+    expect(body.path).toBe('/api/users')
+    expect(body.status).toBe(200)
+    expect(body.service).toBe('test-service')
+    expect(body.headers['app-id']).toBe('app123')
+    expect(body.headers['user-agent']).toBe('Test Browser')
+    expect(body.query).toEqual({ page: '1' })
+    expect(body.response).toEqual({ success: true, message: 'OK' })
+  })
+
+  it('HTTP 请求失败时应该调用 onError', async () => {
+    const onError = vi.fn()
+    fetchMock.mockResolvedValue({ ok: false, status: 500, statusText: 'Server Error' })
+
+    const middleware = requestLogger({
+      url: 'http://log-server/api/logs',
+      service: 'test-service',
+      onError,
+    })
+
+    const mockResponse = new Response('{}')
+    const mockNext = vi.fn().mockResolvedValue(mockResponse)
+    const mockReq = new Request('http://example.com/api/test')
+
+    await middleware(mockReq, mockNext)
+
+    // 等待异步操作
+    await new Promise((r) => setTimeout(r, 50))
+
+    expect(onError).toHaveBeenCalledWith(expect.any(Error))
+    expect(onError.mock.calls[0][0].message).toContain('500')
   })
 })
-
