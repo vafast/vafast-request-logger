@@ -16,18 +16,14 @@ import { sanitize, sanitizeHeaders, type SanitizeConfig } from './sanitize'
 
 // ============ Types ============
 
-export interface RequestLog {
+/** 请求信息 */
+export interface RequestData {
   method: string
   url: string
   path: string
   headers: Record<string, string>
   body: unknown
   query: Record<string, string>
-  response: {
-    success?: boolean
-    message?: string
-    code?: number
-  }
   status: number
   duration: number
   userId?: string
@@ -36,26 +32,35 @@ export interface RequestLog {
   authType?: string
   /** 服务标识（区分不同服务，如 auth-server、ones-server） */
   service?: string
+  /** 客户端 IP 地址 */
+  ip?: string
+  /** 浏览器/设备信息 */
+  userAgent?: string
+  /** 分布式追踪 ID */
+  traceId?: string
   createdAt: Date
 }
 
-export interface ResponseLog {
-  requestLogId: string
+/** 响应信息 */
+export interface ResponseData {
   success?: boolean
   message?: string
   code?: number
   data?: unknown
-  createdAt: Date
+}
+
+/** 完整日志数据 */
+export interface LogData {
+  request: RequestData
+  response: ResponseData
 }
 
 /**
- * 存储适配器接口
+ * 存储适配器接口（单一方法）
  */
 export interface StorageAdapter {
-  /** 存储请求日志 */
-  saveRequestLog(log: RequestLog): Promise<string>
-  /** 存储响应详情 */
-  saveResponseLog(log: ResponseLog): Promise<void>
+  /** 存储完整日志（请求+响应） */
+  saveLog(log: LogData): Promise<void>
 }
 
 export interface RequestLoggerConfig {
@@ -69,6 +74,10 @@ export interface RequestLoggerConfig {
   getAppId?: (req: Request) => string | undefined
   /** 获取认证类型的函数（如 apiKey、jwt 等） */
   getAuthType?: (req: Request) => string | undefined
+  /** 获取客户端 IP 的函数 */
+  getClientIp?: (req: Request) => string | undefined
+  /** 获取分布式追踪 ID 的函数 */
+  getTraceId?: (req: Request) => string | undefined
   /** 服务标识（区分不同服务，如 auth-server、ones-server） */
   service?: string
   /** 错误回调 */
@@ -120,6 +129,8 @@ export function createRequestLogger(config: RequestLoggerConfig) {
     getUserId,
     getAppId,
     getAuthType,
+    getClientIp,
+    getTraceId,
     service,
     onError = console.error,
     enabled = true,
@@ -140,6 +151,8 @@ export function createRequestLogger(config: RequestLoggerConfig) {
       getUserId,
       getAppId,
       getAuthType,
+      getClientIp,
+      getTraceId,
       service,
       onError,
     }).catch(onError)
@@ -156,6 +169,8 @@ interface RecordLogOptions {
   getUserId?: (req: Request) => string | undefined
   getAppId?: (req: Request) => string | undefined
   getAuthType?: (req: Request) => string | undefined
+  getClientIp?: (req: Request) => string | undefined
+  getTraceId?: (req: Request) => string | undefined
   service?: string
   onError: (error: Error) => void
 }
@@ -181,7 +196,7 @@ async function recordLog(
   startTime: number,
   options: RecordLogOptions
 ) {
-  const { storage, sanitizeConfig, getUserId, getAppId, getAuthType, service } = options
+  const { storage, sanitizeConfig, getUserId, getAppId, getAuthType, getClientIp, getTraceId, service } = options
 
   const url = new URL(req.url)
   const path = url.pathname
@@ -226,41 +241,42 @@ async function recordLog(
   const now = new Date()
   const duration = Date.now() - startTime
 
-  // 获取用户 ID、应用 ID 和认证类型
+  // 获取用户信息
   const userId = getUserId?.(req)
   const appId = getAppId?.(req)
   const authType = getAuthType?.(req)
+  
+  // 获取客户端信息
+  const ip = getClientIp?.(req)
+  const userAgent = req.headers.get('user-agent') || undefined
+  const traceId = getTraceId?.(req)
 
-  // 存储请求日志
-  const requestLogId = await storage.saveRequestLog({
-    method: req.method,
-    url: req.url,
-    path,
-    headers: sanitizedHeaders,
-    body: sanitizedBody,
-    query: Object.fromEntries(url.searchParams),
+  // 存储完整日志（请求+响应）
+  await storage.saveLog({
+    request: {
+      method: req.method,
+      url: req.url,
+      path,
+      headers: sanitizedHeaders,
+      body: sanitizedBody,
+      query: Object.fromEntries(url.searchParams),
+      status: response.status,
+      duration,
+      userId,
+      appId,
+      authType,
+      service,
+      ip,
+      userAgent,
+      traceId,
+      createdAt: now,
+    },
     response: {
       success: responseData.success,
       message: responseData.message,
       code: responseData.code,
+      data: sanitizedResponseData,
     },
-    status: response.status,
-    duration,
-    userId,
-    appId,
-    authType,
-    service,
-    createdAt: now,
-  })
-
-  // 存储响应详情
-  await storage.saveResponseLog({
-    requestLogId,
-    success: responseData.success,
-    message: responseData.message,
-    code: responseData.code,
-    data: sanitizedResponseData,
-    createdAt: now,
   })
 }
 
@@ -268,6 +284,10 @@ async function recordLog(
 
 /**
  * 创建 MongoDB 存储适配器
+ * 
+ * 内部分表存储：
+ * - 请求主体 → logsCollection
+ * - 响应详情 → logsResponseCollection（通过 logsId 关联）
  * 
  * @example
  * ```typescript
@@ -278,26 +298,51 @@ async function recordLog(
  * ```
  */
 export function createMongoAdapter(
-  db: { collection: (name: string) => { insertOne: (doc: any) => Promise<{ insertedId: { toHexString: () => string } }> } },
+  db: { collection: (name: string) => { insertOne: (doc: unknown) => Promise<{ insertedId: { toHexString: () => string } }> } },
   logsCollection: string = 'logs',
   logsResponseCollection: string = 'logsResponse'
 ): StorageAdapter {
   return {
-    async saveRequestLog(log: RequestLog): Promise<string> {
-      const result = await db.collection(logsCollection).insertOne({
-        ...log,
-        createAt: log.createdAt,
-        updateAt: log.createdAt,
-      })
-      return result.insertedId.toHexString()
-    },
+    async saveLog(log: LogData): Promise<void> {
+      const { request, response } = log
+      const now = request.createdAt
 
-    async saveResponseLog(log: ResponseLog): Promise<void> {
+      // 1. 存储请求主体
+      const result = await db.collection(logsCollection).insertOne({
+        method: request.method,
+        url: request.url,
+        path: request.path,
+        headers: request.headers,
+        body: request.body,
+        query: request.query,
+        response: {
+          success: response.success,
+          message: response.message,
+          code: response.code,
+        },
+        status: request.status,
+        duration: request.duration,
+        userId: request.userId,
+        appId: request.appId,
+        authType: request.authType,
+        service: request.service,
+        ip: request.ip,
+        userAgent: request.userAgent,
+        traceId: request.traceId,
+        createAt: now,
+        updateAt: now,
+      })
+
+      const logId = result.insertedId.toHexString()
+
+      // 2. 存储响应详情
       await db.collection(logsResponseCollection).insertOne({
-        logsId: log.requestLogId,
-        ...log,
-        createAt: log.createdAt,
-        updateAt: log.createdAt,
+        logsId: logId,
+        success: response.success,
+        message: response.message,
+        code: response.code,
+        data: response.data,
+        createAt: now,
       })
     },
   }
@@ -309,18 +354,128 @@ export function createMongoAdapter(
  * 创建控制台存储适配器（用于开发调试）
  */
 export function createConsoleAdapter(): StorageAdapter {
-  let idCounter = 0
+  return {
+    async saveLog(log: LogData): Promise<void> {
+      const { request, response } = log
+      console.log(`[LOG] ${request.method} ${request.path} ${request.status} ${request.duration}ms`)
+      if (!response.success) {
+        console.log(`[ERROR] ${response.message}`)
+      }
+    },
+  }
+}
+
+// ============ HTTP Adapter ============
+
+export interface HttpAdapterConfig {
+  /** 日志写入 URL */
+  url: string
+  /** 自定义请求头（如认证信息） */
+  headers?: Record<string, string>
+  /** 超时时间（毫秒），默认 5000 */
+  timeout?: number
+  /** 
+   * 自定义日志字段映射
+   * @param log 完整日志数据（请求+响应）
+   * @returns 发送到服务端的数据
+   */
+  mapLog?: (log: LogData) => Record<string, unknown>
+  /** 错误回调 */
+  onError?: (error: Error) => void
+}
+
+/**
+ * 创建 HTTP 存储适配器
+ * 
+ * 适用于微服务架构，将日志通过 HTTP API 发送到远程日志服务
+ * 
+ * 特点：
+ * - 单次 HTTP 请求
+ * - 服务端负责分表存储（logs + logsResponse）
+ * 
+ * @example
+ * ```typescript
+ * const adapter = createHttpAdapter({
+ *   url: 'http://log-server/api/logs/ingest',
+ *   headers: {
+ *     'Authorization': 'Bearer your-api-key',
+ *   },
+ * })
+ * ```
+ */
+export function createHttpAdapter(config: HttpAdapterConfig): StorageAdapter {
+  const {
+    url,
+    headers = {},
+    timeout = 5000,
+    mapLog,
+    onError,
+  } = config
+
+  // 默认日志映射
+  const defaultMapLog = (log: LogData): Record<string, unknown> => ({
+    // 请求信息
+    method: log.request.method,
+    url: log.request.url,
+    path: log.request.path,
+    headers: log.request.headers,
+    body: log.request.body,
+    query: log.request.query,
+    status: log.request.status,
+    duration: log.request.duration,
+    userId: log.request.userId,
+    appId: log.request.appId,
+    authType: log.request.authType,
+    service: log.request.service,
+    ip: log.request.ip,
+    userAgent: log.request.userAgent,
+    traceId: log.request.traceId,
+    createdAt: log.request.createdAt.toISOString(),
+    // 响应摘要
+    response: {
+      success: log.response.success,
+      message: log.response.message,
+      code: log.response.code,
+    },
+    // 响应详情
+    responseData: log.response.data,
+  })
+
+  // 带超时的 fetch
+  const fetchWithTimeout = async (targetUrl: string, options: RequestInit): Promise<Response> => {
+    const controller = new AbortController()
+    const timeoutId = setTimeout(() => controller.abort(), timeout)
+
+    try {
+      const res = await fetch(targetUrl, {
+        ...options,
+        signal: controller.signal,
+      })
+      return res
+    } finally {
+      clearTimeout(timeoutId)
+    }
+  }
 
   return {
-    async saveRequestLog(log: RequestLog): Promise<string> {
-      const id = `log_${++idCounter}`
-      console.log(`[REQUEST] ${log.method} ${log.path} ${log.status} ${log.duration}ms`)
-      return id
-    },
+    async saveLog(log: LogData): Promise<void> {
+      try {
+        const body = (mapLog || defaultMapLog)(log)
 
-    async saveResponseLog(log: ResponseLog): Promise<void> {
-      if (!log.success) {
-        console.log(`[RESPONSE ERROR] ${log.message}`)
+        const res = await fetchWithTimeout(url, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            ...headers,
+          },
+          body: JSON.stringify(body),
+        })
+
+        if (!res.ok) {
+          throw new Error(`HTTP ${res.status}: ${res.statusText}`)
+        }
+      } catch (error) {
+        onError?.(error as Error)
       }
     },
   }

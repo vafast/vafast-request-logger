@@ -6,7 +6,8 @@ API request logging middleware for Vafast with automatic sensitive data sanitiza
 
 - 📝 Automatic API request/response logging
 - 🔒 Built-in sensitive data sanitization (passwords, tokens, etc.)
-- 🔌 Pluggable storage adapters (MongoDB, Console, Custom)
+- 🔌 Pluggable storage adapters (MongoDB, HTTP, Console, Custom)
+- 🌐 HTTP adapter for microservices architecture
 - ⚡ Non-blocking async logging
 - 🚫 Path exclusion support
 - 📊 Request duration tracking
@@ -41,6 +42,22 @@ const requestLogger = createRequestLogger({
 })
 
 server.use(requestLogger)
+```
+
+### With HTTP (Microservices)
+
+```typescript
+import { createRequestLogger, createHttpAdapter } from '@vafast/request-logger'
+
+const requestLogger = createRequestLogger({
+  storage: createHttpAdapter({
+    url: 'http://log-server:9005/api/logs/ingest',
+    headers: {
+      'Authorization': 'Bearer your-api-key',
+    },
+  }),
+  service: 'auth-server',
+})
 ```
 
 ### Development (Console)
@@ -107,59 +124,122 @@ interface RequestLoggerConfig {
 }
 ```
 
+## HTTP Adapter Configuration
+
+For microservices architecture, use `createHttpAdapter` to send logs to a remote log service.
+
+**Features:**
+- Single HTTP request per log (request + response combined)
+- Server-side splits data into separate collections
+- Reduced network overhead
+
+```typescript
+import { createHttpAdapter } from '@vafast/request-logger'
+
+const adapter = createHttpAdapter({
+  // Required: API endpoint
+  url: 'http://log-server/api/logs/ingest',
+  
+  // Optional: Custom headers (authentication, etc.)
+  headers: {
+    'Authorization': 'Bearer ak_xxx:sk_xxx',
+  },
+  
+  // Optional: Timeout in milliseconds (default: 5000)
+  timeout: 5000,
+  
+  // Optional: Custom field mapping
+  mapLog: (log) => ({
+    ...log.request,
+    responseData: log.response.data,
+    timestamp: log.request.createdAt.toISOString(),
+  }),
+  
+  // Optional: Error callback
+  onError: (error) => console.error('Log failed:', error),
+})
+```
+
+### HTTP Adapter Config Reference
+
+| Option | Type | Required | Default | Description |
+|--------|------|----------|---------|-------------|
+| `url` | `string` | ✅ | - | Log API endpoint |
+| `headers` | `Record<string, string>` | ❌ | `{}` | Custom HTTP headers |
+| `timeout` | `number` | ❌ | `5000` | Request timeout (ms) |
+| `mapLog` | `(log: LogData) => object` | ❌ | Built-in | Field mapping function |
+| `onError` | `(error) => void` | ❌ | - | Error callback |
+
+### Expected Request Body
+
+The adapter sends a combined log with this default structure:
+
+```json
+{
+  "method": "POST",
+  "url": "http://example.com/api/users",
+  "path": "/api/users",
+  "headers": {},
+  "body": {},
+  "query": {},
+  "status": 200,
+  "duration": 15,
+  "userId": "123",
+  "appId": "app_1",
+  "authType": "jwt",
+  "service": "auth-server",
+  "createdAt": "2024-01-01T00:00:00.000Z",
+  "response": { "success": true, "message": "OK", "code": 0 },
+  "responseData": { /* full response data */ }
+}
+```
+
+The server should split and store:
+- Main fields → `logs` collection
+- `responseData` → `logsResponse` collection (with reference to log ID)
+
 ## Custom Storage Adapter
 
 ```typescript
-import type { StorageAdapter } from '@vafast/request-logger'
+import type { StorageAdapter, LogData } from '@vafast/request-logger'
 
 const myAdapter: StorageAdapter = {
-  async saveRequestLog(log) {
-    // Save to your database
-    const id = await myDb.insert('request_logs', log)
-    return id
-  },
-
-  async saveResponseLog(log) {
-    // Save response details
-    await myDb.insert('response_logs', log)
+  async saveLog(log: LogData) {
+    // log.request - 请求信息
+    // log.response - 响应信息（包含 data）
+    await myDb.insert('logs', {
+      ...log.request,
+      response: log.response,
+    })
   },
 }
 ```
 
 ## Log Structure
 
-### Request Log
-
 ```typescript
-{
-  method: 'POST',
-  url: 'http://localhost:3000/api/users',
-  path: '/api/users',
-  headers: { /* sanitized */ },
-  body: { /* sanitized */ },
-  query: {},
+interface LogData {
+  request: {
+    method: 'POST',
+    url: 'http://localhost:3000/api/users',
+    path: '/api/users',
+    headers: { /* sanitized */ },
+    body: { /* sanitized */ },
+    query: {},
+    status: 200,
+    duration: 15,
+    userId: '123',
+    appId: 'app_1',
+    authType: 'jwt',
+    service: 'auth-server',
+    createdAt: Date,
+  },
   response: {
     success: true,
     message: 'OK',
     code: 0,
+    data: { /* sanitized response data */ },
   },
-  status: 200,
-  duration: 15,
-  userId: '123',
-  createdAt: Date,
-}
-```
-
-### Response Log
-
-```typescript
-{
-  requestLogId: 'abc123',
-  success: true,
-  message: 'OK',
-  code: 0,
-  data: { /* sanitized response data */ },
-  createdAt: Date,
 }
 ```
 
