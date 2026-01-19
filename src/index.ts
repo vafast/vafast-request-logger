@@ -73,6 +73,8 @@ export interface RequestLoggerOptions {
   onError?: (error: Error) => void
   /** 是否启用 @default true */
   enabled?: boolean
+  /** 排除的路径列表（精确匹配或正则），这些路径不记录日志 */
+  excludePaths?: (string | RegExp)[]
 }
 
 
@@ -101,6 +103,7 @@ export function requestLogger(options: RequestLoggerOptions) {
     sanitize: sanitizeConfig,
     onError = console.error,
     enabled = true,
+    excludePaths = [],
   } = options
 
   return defineMiddleware(async (req, next) => {
@@ -117,6 +120,7 @@ export function requestLogger(options: RequestLoggerOptions) {
       timeout,
       sanitizeConfig,
       onError,
+      excludePaths,
     }).catch(onError)
 
     return response
@@ -135,6 +139,7 @@ interface RecordLogOptions {
   timeout: number
   sanitizeConfig?: SanitizeConfig
   onError: (error: Error) => void
+  excludePaths: (string | RegExp)[]
 }
 
 /** 检查路由是否配置了 log: false */
@@ -145,6 +150,16 @@ function shouldSkipLog(method: string, path: string): boolean {
   } catch {
     return false
   }
+}
+
+/** 检查路径是否在排除列表中 */
+function isPathExcluded(path: string, excludePaths: (string | RegExp)[]): boolean {
+  return excludePaths.some(pattern => {
+    if (typeof pattern === 'string') {
+      return path === pattern || path.startsWith(pattern + '/')
+    }
+    return pattern.test(path)
+  })
 }
 
 /** 带超时的 fetch */
@@ -169,10 +184,13 @@ async function recordLog(
   startTime: number,
   options: RecordLogOptions
 ) {
-  const { url: logUrl, service, headers: customHeaders, timeout, sanitizeConfig, onError } = options
+  const { url: logUrl, service, headers: customHeaders, timeout, sanitizeConfig, onError, excludePaths } = options
 
   const reqUrl = new URL(req.url)
   const path = reqUrl.pathname
+
+  // 检查路径是否在排除列表中
+  if (isPathExcluded(path, excludePaths)) return
 
   // 检查路由是否禁用日志
   if (shouldSkipLog(req.method, path)) return
