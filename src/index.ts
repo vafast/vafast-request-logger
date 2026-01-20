@@ -43,13 +43,8 @@ export interface RequestData {
   createdAt: Date
 }
 
-/** 响应信息 */
-export interface ResponseData {
-  success?: boolean
-  message?: string
-  code?: number
-  data?: unknown
-}
+/** 响应数据（完整响应体） */
+export type ResponseData = unknown
 
 /** 完整日志数据 */
 export interface LogData {
@@ -207,11 +202,11 @@ async function recordLog(
   }
 
   // 解析响应体
-  let responseData: ResponseData = {}
+  let responseData: ResponseData = null
   try {
     responseData = await response.clone().json()
   } catch {
-    // 忽略
+    // 忽略（非 JSON 响应）
   }
 
   // 提取请求头
@@ -223,7 +218,7 @@ async function recordLog(
   // 清洗敏感数据
   const sanitizedHeaders = sanitizeHeaders(headers, sanitizeConfig)
   const sanitizedBody = sanitize(body, sanitizeConfig)
-  const sanitizedResponseData = sanitize(responseData.data, sanitizeConfig)
+  const sanitizedResponseData = sanitize(responseData, sanitizeConfig)
 
   // 构建日志数据（业务字段由 log-server 从 headers 解析）
   const logBody = {
@@ -237,12 +232,7 @@ async function recordLog(
     duration: Date.now() - startTime,
     service,
     createdAt: new Date().toISOString(),
-    response: {
-      success: responseData.success,
-      message: responseData.message,
-      code: responseData.code,
-    },
-    responseData: sanitizedResponseData,
+    response: sanitizedResponseData, // 直接存储完整响应数据
   }
 
   // 发送到日志服务
