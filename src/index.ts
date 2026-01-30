@@ -70,15 +70,26 @@ export interface ErrorThrottleConfig {
 
 /** stdout 双写配置 */
 export interface StdoutConfig {
-  /** 是否启用 stdout 输出 @default false */
+  /** 是否启用 stdout 输出 @default true */
   enabled?: boolean
   /** 输出格式 @default 'json' */
   format?: 'json' | 'text'
+  /** 是否包含请求体 @default true */
+  includeBody?: boolean
   /** 是否包含响应体（可能很大）@default false */
   includeResponse?: boolean
-  /** 是否包含请求体 @default false */
-  includeBody?: boolean
 }
+
+/** 默认排除的路径（健康检查等） */
+const DEFAULT_EXCLUDE_PATHS = [
+  '/health',
+  '/healthz',
+  '/ready',
+  '/readiness',
+  '/liveness',
+  '/metrics',
+  '/favicon.ico',
+]
 
 /** 请求日志配置 */
 export interface RequestLoggerOptions {
@@ -98,12 +109,18 @@ export interface RequestLoggerOptions {
   enabled?: boolean
   /** 排除的路径列表（精确匹配或正则），这些路径不记录日志 */
   excludePaths?: (string | RegExp)[]
+  /** 是否使用默认排除路径（/health, /metrics 等）@default true */
+  useDefaultExcludePaths?: boolean
   /** 熔断器配置 */
   circuitBreaker?: CircuitBreakerConfig
   /** 错误节流配置 */
   errorThrottle?: ErrorThrottleConfig
   /** stdout 双写配置（用于 K8s 日志采集） */
   stdout?: StdoutConfig
+  /** 日志采样率 (0-1)，1 表示记录所有请求，0.1 表示只记录 10% @default 1 */
+  sampleRate?: number
+  /** 请求 ID 的 header 名称，用于分布式追踪 @default 'x-request-id' */
+  requestIdHeader?: string
 }
 
 // ============ Circuit Breaker ============
@@ -188,6 +205,30 @@ class ErrorThrottle {
   }
 }
 
+// ============ Default Error Handler ============
+
+/**
+ * 默认错误处理函数
+ * - 输出结构化 JSON 到 stdout（K8s 友好）
+ * - 使用 warn 级别（level: 40）
+ * - 包含 droppedCount 信息
+ */
+function defaultOnError(error: Error, context: { droppedCount: number }): void {
+  const { droppedCount } = context
+  const log = {
+    level: 40, // warn
+    time: Date.now(),
+    errorName: error.name,
+    errorMessage: error.message,
+    droppedCount,
+    msg:
+      droppedCount > 0
+        ? `request-logger 上报失败 (已忽略 ${droppedCount} 条相同错误)`
+        : 'request-logger 上报失败',
+  }
+  console.log(JSON.stringify(log))
+}
+
 // ============ Middleware ============
 
 /**
@@ -211,13 +252,21 @@ export function requestLogger(options: RequestLoggerOptions) {
     headers = {},
     timeout = 5000,
     sanitize: sanitizeConfig,
-    onError = console.error,
+    onError = defaultOnError,
     enabled = true,
     excludePaths = [],
+    useDefaultExcludePaths = true,
     circuitBreaker: circuitBreakerConfig,
     errorThrottle: errorThrottleConfig,
     stdout: stdoutConfig,
+    sampleRate = 1,
+    requestIdHeader = 'x-request-id',
   } = options
+
+  // 合并默认排除路径
+  const allExcludePaths = useDefaultExcludePaths
+    ? [...DEFAULT_EXCLUDE_PATHS, ...excludePaths]
+    : excludePaths
 
   // 创建熔断器和错误节流器实例
   const circuitBreaker = new CircuitBreaker(circuitBreakerConfig)
@@ -229,6 +278,11 @@ export function requestLogger(options: RequestLoggerOptions) {
     const startTime = Date.now()
     const response = await next()
 
+    // 日志采样：随机跳过部分请求
+    if (sampleRate < 1 && Math.random() > sampleRate) {
+      return response
+    }
+
     // 异步记录日志，不阻塞响应
     recordLog(req, response, startTime, {
       url,
@@ -237,10 +291,11 @@ export function requestLogger(options: RequestLoggerOptions) {
       timeout,
       sanitizeConfig,
       onError,
-      excludePaths,
+      excludePaths: allExcludePaths,
       circuitBreaker,
       errorThrottle,
       stdoutConfig,
+      requestIdHeader,
     }).catch(() => {
       // 错误已在 recordLog 内部处理，这里静默忽略
     })
@@ -265,6 +320,7 @@ interface RecordLogOptions {
   circuitBreaker: CircuitBreaker
   errorThrottle: ErrorThrottle
   stdoutConfig?: StdoutConfig
+  requestIdHeader: string
 }
 
 /** 检查路由是否配置了 log: false */
@@ -306,6 +362,40 @@ async function fetchWithTimeout(
   }
 }
 
+/** 从请求中提取客户端 IP */
+function getClientIp(req: Request): string | undefined {
+  // 按优先级尝试获取真实 IP
+  const forwarded = req.headers.get('x-forwarded-for')
+  if (forwarded) {
+    // X-Forwarded-For 可能包含多个 IP，第一个是客户端真实 IP
+    return forwarded.split(',')[0].trim()
+  }
+  return (
+    req.headers.get('x-real-ip') ??
+    req.headers.get('cf-connecting-ip') ?? // Cloudflare
+    req.headers.get('true-client-ip') ?? // Akamai
+    undefined
+  )
+}
+
+/** 从请求中提取 Request ID */
+function getRequestId(req: Request, headerName: string): string | undefined {
+  // 优先从 req.id 获取（如果使用了 @vafast/request-id 中间件）
+  const reqWithId = req as Request & { id?: string }
+  if (reqWithId.id) {
+    return reqWithId.id
+  }
+  // 否则从 header 获取
+  return req.headers.get(headerName) ?? undefined
+}
+
+/** 根据状态码获取日志级别 */
+function getLogLevel(status: number): number {
+  if (status >= 500) return 50 // ERROR
+  if (status >= 400) return 40 // WARN
+  return 30 // INFO
+}
+
 async function recordLog(
   req: Request,
   response: Response,
@@ -323,6 +413,7 @@ async function recordLog(
     circuitBreaker,
     errorThrottle,
     stdoutConfig,
+    requestIdHeader,
   } = options
 
   const reqUrl = new URL(req.url)
@@ -366,8 +457,12 @@ async function recordLog(
 
   const duration = Date.now() - startTime
 
+  // 提取客户端 IP 和 Request ID
+  const clientIp = getClientIp(req)
+  const requestId = getRequestId(req, requestIdHeader)
+
   // 构建日志数据（业务字段由 log-server 从 headers 解析）
-  const logBody = {
+  const logBody: Record<string, unknown> = {
     method: req.method,
     url: req.url,
     path,
@@ -381,9 +476,13 @@ async function recordLog(
     response: sanitizedResponseData, // 直接存储完整响应数据
   }
 
-  // 双写：输出到 stdout（用于 K8s 日志采集）
-  if (stdoutConfig?.enabled) {
-    writeToStdout(logBody, stdoutConfig)
+  // 可选字段（只在有值时添加）
+  if (clientIp) logBody.clientIp = clientIp
+  if (requestId) logBody.requestId = requestId
+
+  // 双写：输出到 stdout（用于 K8s 日志采集，默认开启）
+  if (stdoutConfig?.enabled !== false) {
+    writeToStdout(logBody, stdoutConfig ?? {})
   }
 
   // 熔断器检查：如果熔断打开，直接跳过 HTTP 上报
@@ -426,20 +525,26 @@ function writeToStdout(
   logBody: Record<string, unknown>,
   config: StdoutConfig
 ): void {
-  const { format = 'json', includeResponse = false, includeBody = false } =
+  const { format = 'json', includeBody = true, includeResponse = false } =
     config
+
+  const status = logBody.status as number
 
   // 构建精简版日志（避免 stdout 日志过大）
   const stdoutLog: Record<string, unknown> = {
-    level: 30, // INFO level (pino 格式)
+    level: getLogLevel(status), // 根据状态码设置日志级别
     time: Date.now(),
     service: logBody.service,
     method: logBody.method,
     path: logBody.path,
-    status: logBody.status,
+    status,
     duration: logBody.duration,
-    msg: `${logBody.method} ${logBody.path} ${logBody.status} ${logBody.duration}ms`,
+    msg: `${logBody.method} ${logBody.path} ${status} ${logBody.duration}ms`,
   }
+
+  // 可选字段
+  if (logBody.requestId) stdoutLog.requestId = logBody.requestId
+  if (logBody.clientIp) stdoutLog.clientIp = logBody.clientIp
 
   // 可选：包含请求体
   if (includeBody && logBody.body) {
@@ -455,8 +560,9 @@ function writeToStdout(
     console.log(JSON.stringify(stdoutLog))
   } else {
     // text 格式：更易读
+    const reqId = logBody.requestId ? ` [${logBody.requestId}]` : ''
     console.log(
-      `[${new Date().toISOString()}] ${logBody.method} ${logBody.path} ${logBody.status} ${logBody.duration}ms`
+      `[${new Date().toISOString()}]${reqId} ${logBody.method} ${logBody.path} ${status} ${logBody.duration}ms`
     )
   }
 }

@@ -1,5 +1,20 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { requestLogger, type RequestLoggerOptions } from './index'
+import { requestLogger } from './index'
+
+/** 捕获 console.log 输出 */
+function captureConsoleLog(): { logs: string[]; restore: () => void } {
+  const logs: string[] = []
+  const originalLog = console.log
+  console.log = (...args: unknown[]) => {
+    logs.push(args.map(String).join(' '))
+  }
+  return {
+    logs,
+    restore: () => {
+      console.log = originalLog
+    },
+  }
+}
 
 describe('requestLogger', () => {
   let fetchMock: ReturnType<typeof vi.fn>
@@ -310,5 +325,427 @@ describe('错误节流 (Error Throttle)', () => {
     expect(onError).toHaveBeenCalledTimes(2)
     // 第二次调用应该有 droppedCount = 2（第一批的后两个被忽略了）
     expect(onError.mock.calls[1][1].droppedCount).toBe(2)
+  })
+})
+
+describe('状态码日志级别', () => {
+  let fetchMock: ReturnType<typeof vi.fn>
+
+  beforeEach(() => {
+    fetchMock = vi.fn().mockResolvedValue({ ok: true })
+    vi.stubGlobal('fetch', fetchMock)
+  })
+
+  afterEach(() => {
+    vi.unstubAllGlobals()
+  })
+
+  it('2xx 响应应该输出 INFO 级别 (level: 30)', async () => {
+    const { logs, restore } = captureConsoleLog()
+
+    const middleware = requestLogger({
+      url: 'http://log-server/api/logs',
+      service: 'test-service',
+      stdout: { enabled: true },
+    })
+
+    const mockResponse = new Response('{}', { status: 200 })
+    const mockNext = vi.fn().mockResolvedValue(mockResponse)
+    const mockReq = new Request('http://example.com/api/test')
+
+    await middleware(mockReq, mockNext)
+    await new Promise((r) => setTimeout(r, 50))
+
+    restore()
+
+    const stdoutLog = JSON.parse(logs[0])
+    expect(stdoutLog.level).toBe(30)
+  })
+
+  it('4xx 响应应该输出 WARN 级别 (level: 40)', async () => {
+    const { logs, restore } = captureConsoleLog()
+
+    const middleware = requestLogger({
+      url: 'http://log-server/api/logs',
+      service: 'test-service',
+      stdout: { enabled: true },
+    })
+
+    const mockResponse = new Response('{}', { status: 404 })
+    const mockNext = vi.fn().mockResolvedValue(mockResponse)
+    const mockReq = new Request('http://example.com/api/notfound')
+
+    await middleware(mockReq, mockNext)
+    await new Promise((r) => setTimeout(r, 50))
+
+    restore()
+
+    const stdoutLog = JSON.parse(logs[0])
+    expect(stdoutLog.level).toBe(40)
+    expect(stdoutLog.status).toBe(404)
+  })
+
+  it('5xx 响应应该输出 ERROR 级别 (level: 50)', async () => {
+    const { logs, restore } = captureConsoleLog()
+
+    const middleware = requestLogger({
+      url: 'http://log-server/api/logs',
+      service: 'test-service',
+      stdout: { enabled: true },
+    })
+
+    const mockResponse = new Response('{}', { status: 500 })
+    const mockNext = vi.fn().mockResolvedValue(mockResponse)
+    const mockReq = new Request('http://example.com/api/error')
+
+    await middleware(mockReq, mockNext)
+    await new Promise((r) => setTimeout(r, 50))
+
+    restore()
+
+    const stdoutLog = JSON.parse(logs[0])
+    expect(stdoutLog.level).toBe(50)
+    expect(stdoutLog.status).toBe(500)
+  })
+})
+
+describe('默认排除路径', () => {
+  let fetchMock: ReturnType<typeof vi.fn>
+
+  beforeEach(() => {
+    fetchMock = vi.fn().mockResolvedValue({ ok: true })
+    vi.stubGlobal('fetch', fetchMock)
+  })
+
+  afterEach(() => {
+    vi.unstubAllGlobals()
+  })
+
+  it('默认应该排除 /health 路径', async () => {
+    const { logs, restore } = captureConsoleLog()
+
+    const middleware = requestLogger({
+      url: 'http://log-server/api/logs',
+      service: 'test-service',
+    })
+
+    const mockResponse = new Response('{}', { status: 200 })
+    const mockNext = vi.fn().mockResolvedValue(mockResponse)
+    const mockReq = new Request('http://example.com/health')
+
+    await middleware(mockReq, mockNext)
+    await new Promise((r) => setTimeout(r, 50))
+
+    restore()
+
+    expect(fetchMock).not.toHaveBeenCalled()
+    expect(logs.length).toBe(0)
+  })
+
+  it('默认应该排除 /metrics 路径', async () => {
+    const { logs, restore } = captureConsoleLog()
+
+    const middleware = requestLogger({
+      url: 'http://log-server/api/logs',
+      service: 'test-service',
+    })
+
+    const mockResponse = new Response('{}', { status: 200 })
+    const mockNext = vi.fn().mockResolvedValue(mockResponse)
+    const mockReq = new Request('http://example.com/metrics')
+
+    await middleware(mockReq, mockNext)
+    await new Promise((r) => setTimeout(r, 50))
+
+    restore()
+
+    expect(fetchMock).not.toHaveBeenCalled()
+    expect(logs.length).toBe(0)
+  })
+
+  it('useDefaultExcludePaths=false 时不应该排除默认路径', async () => {
+    const { logs, restore } = captureConsoleLog()
+
+    const middleware = requestLogger({
+      url: 'http://log-server/api/logs',
+      service: 'test-service',
+      useDefaultExcludePaths: false,
+    })
+
+    const mockResponse = new Response('{}', { status: 200 })
+    const mockNext = vi.fn().mockResolvedValue(mockResponse)
+    const mockReq = new Request('http://example.com/health')
+
+    await middleware(mockReq, mockNext)
+    await new Promise((r) => setTimeout(r, 50))
+
+    restore()
+
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    expect(logs.length).toBe(1)
+  })
+})
+
+describe('客户端 IP 提取', () => {
+  let fetchMock: ReturnType<typeof vi.fn>
+
+  beforeEach(() => {
+    fetchMock = vi.fn().mockResolvedValue({ ok: true })
+    vi.stubGlobal('fetch', fetchMock)
+  })
+
+  afterEach(() => {
+    vi.unstubAllGlobals()
+  })
+
+  it('应该从 X-Forwarded-For 提取客户端 IP', async () => {
+    const { logs, restore } = captureConsoleLog()
+
+    const middleware = requestLogger({
+      url: 'http://log-server/api/logs',
+      service: 'test-service',
+    })
+
+    const mockResponse = new Response('{}', { status: 200 })
+    const mockNext = vi.fn().mockResolvedValue(mockResponse)
+    const mockReq = new Request('http://example.com/api/test', {
+      headers: { 'X-Forwarded-For': '1.2.3.4, 5.6.7.8' },
+    })
+
+    await middleware(mockReq, mockNext)
+    await new Promise((r) => setTimeout(r, 50))
+
+    restore()
+
+    const stdoutLog = JSON.parse(logs[0])
+    expect(stdoutLog.clientIp).toBe('1.2.3.4')
+  })
+
+  it('应该从 X-Real-IP 提取客户端 IP', async () => {
+    const { logs, restore } = captureConsoleLog()
+
+    const middleware = requestLogger({
+      url: 'http://log-server/api/logs',
+      service: 'test-service',
+    })
+
+    const mockResponse = new Response('{}', { status: 200 })
+    const mockNext = vi.fn().mockResolvedValue(mockResponse)
+    const mockReq = new Request('http://example.com/api/test', {
+      headers: { 'X-Real-IP': '10.20.30.40' },
+    })
+
+    await middleware(mockReq, mockNext)
+    await new Promise((r) => setTimeout(r, 50))
+
+    restore()
+
+    const stdoutLog = JSON.parse(logs[0])
+    expect(stdoutLog.clientIp).toBe('10.20.30.40')
+  })
+
+  it('X-Forwarded-For 优先于 X-Real-IP', async () => {
+    const { logs, restore } = captureConsoleLog()
+
+    const middleware = requestLogger({
+      url: 'http://log-server/api/logs',
+      service: 'test-service',
+    })
+
+    const mockResponse = new Response('{}', { status: 200 })
+    const mockNext = vi.fn().mockResolvedValue(mockResponse)
+    const mockReq = new Request('http://example.com/api/test', {
+      headers: {
+        'X-Forwarded-For': '1.1.1.1',
+        'X-Real-IP': '2.2.2.2',
+      },
+    })
+
+    await middleware(mockReq, mockNext)
+    await new Promise((r) => setTimeout(r, 50))
+
+    restore()
+
+    const stdoutLog = JSON.parse(logs[0])
+    expect(stdoutLog.clientIp).toBe('1.1.1.1')
+  })
+})
+
+describe('Request ID 提取', () => {
+  let fetchMock: ReturnType<typeof vi.fn>
+
+  beforeEach(() => {
+    fetchMock = vi.fn().mockResolvedValue({ ok: true })
+    vi.stubGlobal('fetch', fetchMock)
+  })
+
+  afterEach(() => {
+    vi.unstubAllGlobals()
+  })
+
+  it('应该从 x-request-id header 提取 Request ID', async () => {
+    const { logs, restore } = captureConsoleLog()
+
+    const middleware = requestLogger({
+      url: 'http://log-server/api/logs',
+      service: 'test-service',
+    })
+
+    const mockResponse = new Response('{}', { status: 200 })
+    const mockNext = vi.fn().mockResolvedValue(mockResponse)
+    const mockReq = new Request('http://example.com/api/test', {
+      headers: { 'x-request-id': 'abc-123-def-456' },
+    })
+
+    await middleware(mockReq, mockNext)
+    await new Promise((r) => setTimeout(r, 50))
+
+    restore()
+
+    const stdoutLog = JSON.parse(logs[0])
+    expect(stdoutLog.requestId).toBe('abc-123-def-456')
+  })
+
+  it('应该支持自定义 requestIdHeader', async () => {
+    const { logs, restore } = captureConsoleLog()
+
+    const middleware = requestLogger({
+      url: 'http://log-server/api/logs',
+      service: 'test-service',
+      requestIdHeader: 'x-correlation-id',
+    })
+
+    const mockResponse = new Response('{}', { status: 200 })
+    const mockNext = vi.fn().mockResolvedValue(mockResponse)
+    const mockReq = new Request('http://example.com/api/test', {
+      headers: { 'x-correlation-id': 'corr-789' },
+    })
+
+    await middleware(mockReq, mockNext)
+    await new Promise((r) => setTimeout(r, 50))
+
+    restore()
+
+    const stdoutLog = JSON.parse(logs[0])
+    expect(stdoutLog.requestId).toBe('corr-789')
+  })
+
+  it('应该优先使用 req.id（如果存在）', async () => {
+    const { logs, restore } = captureConsoleLog()
+
+    const middleware = requestLogger({
+      url: 'http://log-server/api/logs',
+      service: 'test-service',
+    })
+
+    const mockResponse = new Response('{}', { status: 200 })
+    const mockNext = vi.fn().mockResolvedValue(mockResponse)
+    const mockReq = new Request('http://example.com/api/test', {
+      headers: { 'x-request-id': 'header-id' },
+    }) as Request & { id?: string }
+    // 模拟 @vafast/request-id 设置的 req.id
+    mockReq.id = 'req-id-from-middleware'
+
+    await middleware(mockReq, mockNext)
+    await new Promise((r) => setTimeout(r, 50))
+
+    restore()
+
+    const stdoutLog = JSON.parse(logs[0])
+    expect(stdoutLog.requestId).toBe('req-id-from-middleware')
+  })
+})
+
+describe('日志采样 (sampleRate)', () => {
+  let fetchMock: ReturnType<typeof vi.fn>
+
+  beforeEach(() => {
+    fetchMock = vi.fn().mockResolvedValue({ ok: true })
+    vi.stubGlobal('fetch', fetchMock)
+  })
+
+  afterEach(() => {
+    vi.unstubAllGlobals()
+  })
+
+  it('sampleRate=1 时应该记录所有请求', async () => {
+    const { logs, restore } = captureConsoleLog()
+
+    const middleware = requestLogger({
+      url: 'http://log-server/api/logs',
+      service: 'test-service',
+      sampleRate: 1,
+    })
+
+    const mockResponse = new Response('{}', { status: 200 })
+    const mockNext = vi.fn().mockResolvedValue(mockResponse)
+
+    // 发送 10 个请求
+    for (let i = 0; i < 10; i++) {
+      await middleware(new Request(`http://example.com/api/test${i}`), mockNext)
+    }
+    await new Promise((r) => setTimeout(r, 100))
+
+    restore()
+
+    expect(logs.length).toBe(10)
+  })
+
+  it('sampleRate=0 时应该不记录任何请求', async () => {
+    const { logs, restore } = captureConsoleLog()
+
+    const middleware = requestLogger({
+      url: 'http://log-server/api/logs',
+      service: 'test-service',
+      sampleRate: 0,
+    })
+
+    const mockResponse = new Response('{}', { status: 200 })
+    const mockNext = vi.fn().mockResolvedValue(mockResponse)
+
+    // 发送 10 个请求
+    for (let i = 0; i < 10; i++) {
+      await middleware(new Request(`http://example.com/api/test${i}`), mockNext)
+    }
+    await new Promise((r) => setTimeout(r, 100))
+
+    restore()
+
+    expect(logs.length).toBe(0)
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+
+  it('sampleRate=0.5 时应该记录约一半请求', async () => {
+    const { logs, restore } = captureConsoleLog()
+
+    // Mock Math.random 以获得可预测的结果
+    let callCount = 0
+    const originalRandom = Math.random
+    Math.random = () => {
+      callCount++
+      // 交替返回 0.3 和 0.7，模拟 50% 采样
+      return callCount % 2 === 1 ? 0.3 : 0.7
+    }
+
+    const middleware = requestLogger({
+      url: 'http://log-server/api/logs',
+      service: 'test-service',
+      sampleRate: 0.5,
+    })
+
+    const mockResponse = new Response('{}', { status: 200 })
+    const mockNext = vi.fn().mockResolvedValue(mockResponse)
+
+    // 发送 10 个请求
+    for (let i = 0; i < 10; i++) {
+      await middleware(new Request(`http://example.com/api/test${i}`), mockNext)
+    }
+    await new Promise((r) => setTimeout(r, 100))
+
+    Math.random = originalRandom
+    restore()
+
+    // 应该有约一半被记录（由于 mock，精确是 5 个）
+    expect(logs.length).toBe(5)
   })
 })
