@@ -110,9 +110,13 @@ describe('requestLogger', () => {
     expect(body.response).toEqual({ success: true, message: 'OK' })
   })
 
-  it('HTTP 请求失败时应该调用 onError', async () => {
+  it('HTTP 请求失败时应该调用 onError 并带 droppedCount', async () => {
     const onError = vi.fn()
-    fetchMock.mockResolvedValue({ ok: false, status: 500, statusText: 'Server Error' })
+    fetchMock.mockResolvedValue({
+      ok: false,
+      status: 500,
+      statusText: 'Server Error',
+    })
 
     const middleware = requestLogger({
       url: 'http://log-server/api/logs',
@@ -129,7 +133,182 @@ describe('requestLogger', () => {
     // 等待异步操作
     await new Promise((r) => setTimeout(r, 50))
 
-    expect(onError).toHaveBeenCalledWith(expect.any(Error))
+    expect(onError).toHaveBeenCalledWith(expect.any(Error), { droppedCount: 0 })
     expect(onError.mock.calls[0][0].message).toContain('500')
+  })
+})
+
+describe('熔断器 (Circuit Breaker)', () => {
+  let fetchMock: ReturnType<typeof vi.fn>
+
+  beforeEach(() => {
+    fetchMock = vi.fn()
+    vi.stubGlobal('fetch', fetchMock)
+  })
+
+  afterEach(() => {
+    vi.unstubAllGlobals()
+  })
+
+  it('连续失败达到阈值后应该停止上报', async () => {
+    const onError = vi.fn()
+    fetchMock.mockResolvedValue({
+      ok: false,
+      status: 500,
+      statusText: 'Server Error',
+    })
+
+    const middleware = requestLogger({
+      url: 'http://log-server/api/logs',
+      service: 'test-service',
+      onError,
+      circuitBreaker: {
+        failureThreshold: 3,
+        resetTimeout: 1000,
+      },
+      errorThrottle: {
+        interval: 0, // 禁用节流以便测试
+      },
+    })
+
+    const mockNext = vi.fn().mockResolvedValue(new Response('{}'))
+
+    // 发送 5 个请求
+    for (let i = 0; i < 5; i++) {
+      const req = new Request(`http://example.com/api/test${i}`)
+      await middleware(req, mockNext)
+      await new Promise((r) => setTimeout(r, 20))
+    }
+
+    // 前 3 次失败会触发 onError，之后熔断器打开，不再尝试
+    // 所以 fetch 只被调用 3 次
+    expect(fetchMock).toHaveBeenCalledTimes(3)
+  })
+
+  it('熔断器恢复后应该重新尝试上报', async () => {
+    fetchMock
+      .mockResolvedValueOnce({ ok: false, status: 500 })
+      .mockResolvedValueOnce({ ok: false, status: 500 })
+      .mockResolvedValueOnce({ ok: false, status: 500 })
+      .mockResolvedValue({ ok: true }) // 恢复后成功
+
+    const middleware = requestLogger({
+      url: 'http://log-server/api/logs',
+      service: 'test-service',
+      circuitBreaker: {
+        failureThreshold: 3,
+        resetTimeout: 100, // 100ms 后恢复
+      },
+      errorThrottle: {
+        interval: 0,
+      },
+    })
+
+    const mockNext = vi.fn().mockResolvedValue(new Response('{}'))
+
+    // 触发熔断
+    for (let i = 0; i < 4; i++) {
+      await middleware(new Request(`http://example.com/api/test${i}`), mockNext)
+      await new Promise((r) => setTimeout(r, 20))
+    }
+
+    expect(fetchMock).toHaveBeenCalledTimes(3) // 熔断后不再调用
+
+    // 等待熔断恢复
+    await new Promise((r) => setTimeout(r, 150))
+
+    // 再发一个请求，应该尝试上报
+    await middleware(new Request('http://example.com/api/test-after'), mockNext)
+    await new Promise((r) => setTimeout(r, 20))
+
+    expect(fetchMock).toHaveBeenCalledTimes(4) // 恢复后重新尝试
+  })
+})
+
+describe('错误节流 (Error Throttle)', () => {
+  let fetchMock: ReturnType<typeof vi.fn>
+
+  beforeEach(() => {
+    fetchMock = vi.fn().mockResolvedValue({
+      ok: false,
+      status: 500,
+      statusText: 'Server Error',
+    })
+    vi.stubGlobal('fetch', fetchMock)
+  })
+
+  afterEach(() => {
+    vi.unstubAllGlobals()
+  })
+
+  it('在节流间隔内只应该打印一次错误', async () => {
+    const onError = vi.fn()
+
+    const middleware = requestLogger({
+      url: 'http://log-server/api/logs',
+      service: 'test-service',
+      onError,
+      circuitBreaker: {
+        failureThreshold: 100, // 设高一点，不触发熔断
+      },
+      errorThrottle: {
+        interval: 200, // 200ms 内只打一次
+      },
+    })
+
+    const mockNext = vi.fn().mockResolvedValue(new Response('{}'))
+
+    // 快速发送 5 个请求
+    for (let i = 0; i < 5; i++) {
+      await middleware(new Request(`http://example.com/api/test${i}`), mockNext)
+      await new Promise((r) => setTimeout(r, 20))
+    }
+
+    // 虽然 fetch 被调用 5 次，但 onError 只被调用 1 次
+    expect(fetchMock).toHaveBeenCalledTimes(5)
+    expect(onError).toHaveBeenCalledTimes(1)
+    expect(onError).toHaveBeenCalledWith(expect.any(Error), { droppedCount: 0 })
+  })
+
+  it('节流后第二次打印应该包含 droppedCount', async () => {
+    const onError = vi.fn()
+
+    const middleware = requestLogger({
+      url: 'http://log-server/api/logs',
+      service: 'test-service',
+      onError,
+      circuitBreaker: {
+        failureThreshold: 100,
+      },
+      errorThrottle: {
+        interval: 100, // 100ms
+      },
+    })
+
+    const mockNext = vi.fn().mockResolvedValue(new Response('{}'))
+
+    // 发送 3 个请求（第一次打印）
+    for (let i = 0; i < 3; i++) {
+      await middleware(new Request(`http://example.com/api/test${i}`), mockNext)
+      await new Promise((r) => setTimeout(r, 20))
+    }
+
+    expect(onError).toHaveBeenCalledTimes(1)
+
+    // 等待节流间隔
+    await new Promise((r) => setTimeout(r, 120))
+
+    // 再发 2 个请求（第二次打印，应该带 droppedCount: 2）
+    for (let i = 0; i < 2; i++) {
+      await middleware(
+        new Request(`http://example.com/api/test-after${i}`),
+        mockNext
+      )
+      await new Promise((r) => setTimeout(r, 20))
+    }
+
+    expect(onError).toHaveBeenCalledTimes(2)
+    // 第二次调用应该有 droppedCount = 2（第一批的后两个被忽略了）
+    expect(onError.mock.calls[1][1].droppedCount).toBe(2)
   })
 })

@@ -1,16 +1,18 @@
 /**
  * @vafast/request-logger - API 请求日志中间件
- * 
+ *
  * 特性：
  * - 自动敏感数据脱敏
  * - HTTP 远程日志服务
  * - 异步非阻塞记录
  * - 路由级别日志控制（路由定义中设置 log: false）
- * 
+ * - 熔断器：连续失败后暂停上报，避免无谓等待
+ * - 错误节流：同类错误在一段时间内只打一次日志
+ *
  * @example
  * ```typescript
  * import { requestLogger } from '@vafast/request-logger'
- * 
+ *
  * server.use(requestLogger({
  *   url: 'http://log-server:9005/api/logs/ingest',
  *   service: 'auth-server',
@@ -52,6 +54,20 @@ export interface LogData {
   response: ResponseData
 }
 
+/** 熔断器配置 */
+export interface CircuitBreakerConfig {
+  /** 触发熔断的连续失败次数，默认 5 */
+  failureThreshold?: number
+  /** 熔断恢复时间（毫秒），默认 60000（1分钟） */
+  resetTimeout?: number
+}
+
+/** 错误节流配置 */
+export interface ErrorThrottleConfig {
+  /** 同类错误的节流间隔（毫秒），默认 60000（1分钟） */
+  interval?: number
+}
+
 /** 请求日志配置 */
 export interface RequestLoggerOptions {
   /** 日志服务 URL */
@@ -65,23 +81,108 @@ export interface RequestLoggerOptions {
   /** 敏感数据清洗配置 */
   sanitize?: SanitizeConfig
   /** 错误回调 */
-  onError?: (error: Error) => void
+  onError?: (error: Error, context: { droppedCount: number }) => void
   /** 是否启用 @default true */
   enabled?: boolean
   /** 排除的路径列表（精确匹配或正则），这些路径不记录日志 */
   excludePaths?: (string | RegExp)[]
+  /** 熔断器配置 */
+  circuitBreaker?: CircuitBreakerConfig
+  /** 错误节流配置 */
+  errorThrottle?: ErrorThrottleConfig
 }
 
+// ============ Circuit Breaker ============
+
+type CircuitState = 'closed' | 'open' | 'half-open'
+
+class CircuitBreaker {
+  private state: CircuitState = 'closed'
+  private failureCount = 0
+  private lastFailureTime = 0
+  private readonly failureThreshold: number
+  private readonly resetTimeout: number
+
+  constructor(config: CircuitBreakerConfig = {}) {
+    this.failureThreshold = config.failureThreshold ?? 5
+    this.resetTimeout = config.resetTimeout ?? 60000
+  }
+
+  /** 检查是否允许请求 */
+  canRequest(): boolean {
+    if (this.state === 'closed') return true
+
+    if (this.state === 'open') {
+      // 检查是否到了恢复时间
+      if (Date.now() - this.lastFailureTime >= this.resetTimeout) {
+        this.state = 'half-open'
+        return true
+      }
+      return false
+    }
+
+    // half-open 状态允许一个请求通过测试
+    return true
+  }
+
+  /** 记录成功 */
+  recordSuccess(): void {
+    this.failureCount = 0
+    this.state = 'closed'
+  }
+
+  /** 记录失败 */
+  recordFailure(): void {
+    this.failureCount++
+    this.lastFailureTime = Date.now()
+
+    if (this.failureCount >= this.failureThreshold) {
+      this.state = 'open'
+    }
+  }
+
+  /** 获取当前状态信息 */
+  getStatus(): { state: CircuitState; failureCount: number } {
+    return { state: this.state, failureCount: this.failureCount }
+  }
+}
+
+// ============ Error Throttle ============
+
+class ErrorThrottle {
+  private lastErrorTime = 0
+  private droppedCount = 0
+  private readonly interval: number
+
+  constructor(config: ErrorThrottleConfig = {}) {
+    this.interval = config.interval ?? 60000
+  }
+
+  /** 检查是否应该打印错误，返回 { shouldLog, droppedCount } */
+  shouldLog(): { shouldLog: boolean; droppedCount: number } {
+    const now = Date.now()
+
+    if (now - this.lastErrorTime >= this.interval) {
+      const dropped = this.droppedCount
+      this.lastErrorTime = now
+      this.droppedCount = 0
+      return { shouldLog: true, droppedCount: dropped }
+    }
+
+    this.droppedCount++
+    return { shouldLog: false, droppedCount: 0 }
+  }
+}
 
 // ============ Middleware ============
 
 /**
  * 请求日志中间件
- * 
+ *
  * @example
  * ```typescript
  * import { requestLogger } from '@vafast/request-logger'
- * 
+ *
  * server.use(requestLogger({
  *   url: 'http://log-server:9005/api/logs/ingest',
  *   service: 'auth-server',
@@ -99,7 +200,13 @@ export function requestLogger(options: RequestLoggerOptions) {
     onError = console.error,
     enabled = true,
     excludePaths = [],
+    circuitBreaker: circuitBreakerConfig,
+    errorThrottle: errorThrottleConfig,
   } = options
+
+  // 创建熔断器和错误节流器实例
+  const circuitBreaker = new CircuitBreaker(circuitBreakerConfig)
+  const errorThrottle = new ErrorThrottle(errorThrottleConfig)
 
   return defineMiddleware(async (req, next) => {
     if (!enabled) return next()
@@ -116,7 +223,11 @@ export function requestLogger(options: RequestLoggerOptions) {
       sanitizeConfig,
       onError,
       excludePaths,
-    }).catch(onError)
+      circuitBreaker,
+      errorThrottle,
+    }).catch(() => {
+      // 错误已在 recordLog 内部处理，这里静默忽略
+    })
 
     return response
   })
@@ -133,8 +244,10 @@ interface RecordLogOptions {
   headers: Record<string, string>
   timeout: number
   sanitizeConfig?: SanitizeConfig
-  onError: (error: Error) => void
+  onError: (error: Error, context: { droppedCount: number }) => void
   excludePaths: (string | RegExp)[]
+  circuitBreaker: CircuitBreaker
+  errorThrottle: ErrorThrottle
 }
 
 /** 检查路由是否配置了 log: false */
@@ -148,8 +261,11 @@ function shouldSkipLog(method: string, path: string): boolean {
 }
 
 /** 检查路径是否在排除列表中 */
-function isPathExcluded(path: string, excludePaths: (string | RegExp)[]): boolean {
-  return excludePaths.some(pattern => {
+function isPathExcluded(
+  path: string,
+  excludePaths: (string | RegExp)[]
+): boolean {
+  return excludePaths.some((pattern) => {
     if (typeof pattern === 'string') {
       return path === pattern || path.startsWith(pattern + '/')
     }
@@ -179,7 +295,17 @@ async function recordLog(
   startTime: number,
   options: RecordLogOptions
 ) {
-  const { url: logUrl, service, headers: customHeaders, timeout, sanitizeConfig, onError, excludePaths } = options
+  const {
+    url: logUrl,
+    service,
+    headers: customHeaders,
+    timeout,
+    sanitizeConfig,
+    onError,
+    excludePaths,
+    circuitBreaker,
+    errorThrottle,
+  } = options
 
   const reqUrl = new URL(req.url)
   const path = reqUrl.pathname
@@ -189,6 +315,11 @@ async function recordLog(
 
   // 检查路由是否禁用日志
   if (shouldSkipLog(req.method, path)) return
+
+  // 熔断器检查：如果熔断打开，直接跳过上报
+  if (!circuitBreaker.canRequest()) {
+    return
+  }
 
   // 解析请求体
   let body: unknown = null
@@ -250,8 +381,18 @@ async function recordLog(
     if (!res.ok) {
       throw new Error(`HTTP ${res.status}: ${res.statusText}`)
     }
+
+    // 成功：重置熔断器
+    circuitBreaker.recordSuccess()
   } catch (error) {
-    onError(error as Error)
+    // 失败：记录到熔断器
+    circuitBreaker.recordFailure()
+
+    // 错误节流：检查是否应该打印
+    const { shouldLog, droppedCount } = errorThrottle.shouldLog()
+    if (shouldLog) {
+      onError(error as Error, { droppedCount })
+    }
   }
 }
 

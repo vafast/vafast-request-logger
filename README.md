@@ -17,13 +17,21 @@ server.use(requestLogger({
   url: 'http://log-server:9005/api/logs/ingest',
   service: 'my-service',
   headers: { Authorization: 'Bearer apiKeyId:apiKeySecret' },
-  onError: (err) => console.error('日志记录失败', err),
+  excludePaths: ['/health', '/metrics'],
+  onError: (err, { droppedCount }) => {
+    console.warn(
+      `日志上报失败: ${err.message}`,
+      droppedCount > 0 ? `(已忽略 ${droppedCount} 条)` : ''
+    )
+  },
 }))
 ```
 
 业务字段（appId、authType、ip、traceId 等）由日志服务端从 headers 自动解析。
 
 ## 配置
+
+### 基础配置
 
 | 参数 | 类型 | 必填 | 默认值 | 说明 |
 |------|------|------|--------|------|
@@ -32,10 +40,99 @@ server.use(requestLogger({
 | `headers` | `Record<string, string>` | 否 | `{}` | 自定义请求头（如认证） |
 | `timeout` | `number` | 否 | `5000` | 超时时间（毫秒） |
 | `sanitize` | `SanitizeConfig` | 否 | - | 敏感数据清洗配置 |
-| `onError` | `(err) => void` | 否 | `console.error` | 错误回调 |
+| `onError` | `(err, ctx) => void` | 否 | `console.error` | 错误回调，`ctx.droppedCount` 为被节流忽略的错误数 |
 | `enabled` | `boolean` | 否 | `true` | 是否启用 |
+| `excludePaths` | `(string \| RegExp)[]` | 否 | `[]` | 排除的路径列表，不记录日志 |
 
-## 路由级别控制
+### 熔断器配置 (Circuit Breaker)
+
+当日志服务不可用时，避免无谓的超时等待。
+
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `circuitBreaker.failureThreshold` | `number` | `5` | 触发熔断的连续失败次数 |
+| `circuitBreaker.resetTimeout` | `number` | `60000` | 熔断恢复时间（毫秒） |
+
+```typescript
+requestLogger({
+  url: '...',
+  service: '...',
+  circuitBreaker: {
+    failureThreshold: 5,  // 连续失败 5 次后熔断
+    resetTimeout: 60000,  // 1 分钟后尝试恢复
+  },
+})
+```
+
+**工作原理**：
+1. 正常状态：每个请求都尝试上报
+2. 连续失败达到阈值：进入熔断状态，跳过所有上报
+3. 熔断时间到期：进入半开状态，允许一个请求通过测试
+4. 测试成功：恢复正常；测试失败：继续熔断
+
+### 错误节流配置 (Error Throttle)
+
+避免相同错误刷屏，在一段时间内只打印一次。
+
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `errorThrottle.interval` | `number` | `60000` | 节流间隔（毫秒） |
+
+```typescript
+requestLogger({
+  url: '...',
+  service: '...',
+  errorThrottle: {
+    interval: 60000,  // 同类错误 1 分钟内只打 1 条
+  },
+  onError: (err, { droppedCount }) => {
+    // droppedCount: 上次打印到这次之间被忽略的错误数
+    logger.warn(
+      { errorName: err.name, errorMessage: err.message, droppedCount },
+      droppedCount > 0
+        ? `日志上报失败 (已忽略 ${droppedCount} 条)`
+        : '日志上报失败'
+    )
+  },
+})
+```
+
+**效果对比**：
+
+```
+# 之前（日志服务挂了）
+日志上报失败
+日志上报失败
+日志上报失败
+... (每秒好几条，刷屏)
+
+# 之后
+日志上报失败
+(沉默 1 分钟)
+日志上报失败 (已忽略 120 条)
+(沉默 1 分钟)
+日志上报失败 (已忽略 118 条)
+```
+
+## 路径排除
+
+### excludePaths 配置
+
+在中间件配置中排除特定路径：
+
+```typescript
+requestLogger({
+  url: '...',
+  service: '...',
+  excludePaths: [
+    '/health',           // 精确匹配
+    '/internal/',        // 前缀匹配（含子路径）
+    /^\/metrics/,        // 正则匹配
+  ],
+})
+```
+
+### 路由级别控制
 
 在路由定义中设置 `log: false` 跳过日志记录：
 
@@ -69,19 +166,8 @@ server.use(requestLogger({
   status: 200,
   duration: 50,
   service: 'my-service',
-  userId: 'user123',
-  appId: 'app456',
-  authType: 'jwt',
-  ip: '192.168.1.1',
-  userAgent: 'Mozilla/5.0...',
-  traceId: 'trace789',
   createdAt: '2024-01-01T00:00:00.000Z',
-  response: {
-    success: true,
-    message: 'OK',
-    code: 0,
-  },
-  responseData: { ... },
+  response: { success: true, message: 'OK' },
 }
 ```
 
@@ -109,8 +195,45 @@ requestLogger({
 
 ## 特性
 
-- 异步非阻塞（不影响响应速度）
-- 自动敏感数据脱敏
-- 路由级别日志控制
-- 支持多租户（appId）
-- 支持分布式追踪（traceId）
+- **异步非阻塞**：不影响响应速度
+- **熔断器**：日志服务故障时自动熔断，避免雪崩
+- **错误节流**：相同错误不刷屏，带统计计数
+- **路径排除**：支持精确匹配、前缀匹配、正则匹配
+- **敏感数据脱敏**：自动清洗密码、Token 等敏感字段
+- **路由级别控制**：可在路由定义中禁用日志
+- **支持多租户**：通过 headers 传递 appId
+- **支持分布式追踪**：通过 headers 传递 traceId
+
+## 完整示例
+
+```typescript
+import { requestLogger } from '@vafast/request-logger'
+import { logger } from './logger'
+
+server.use(requestLogger({
+  url: 'http://log-server:9005/api/logs/ingest',
+  service: 'auth-server',
+  headers: { Authorization: 'Bearer ak_xxx:sk_xxx' },
+  timeout: 5000,
+  enabled: true,
+  excludePaths: ['/health', '/verifyApiKey'],
+  circuitBreaker: {
+    failureThreshold: 5,
+    resetTimeout: 60000,
+  },
+  errorThrottle: {
+    interval: 60000,
+  },
+  onError: (err: Error, { droppedCount }: { droppedCount: number }) =>
+    logger.warn(
+      {
+        errorName: err.name,
+        errorMessage: err.message,
+        droppedCount,
+      },
+      droppedCount > 0
+        ? `request-logger 上报失败 (已忽略 ${droppedCount} 条相同错误)`
+        : 'request-logger 上报失败'
+    ),
+}))
+```
