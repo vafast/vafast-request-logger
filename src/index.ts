@@ -80,16 +80,37 @@ export interface StdoutConfig {
   includeResponse?: boolean
 }
 
-/** 默认排除的路径（健康检查等） */
-const DEFAULT_EXCLUDE_PATHS = [
+/** 默认排除的路径后缀（健康检查等） */
+const DEFAULT_EXCLUDE_SUFFIXES = [
   '/health',
   '/healthz',
   '/ready',
   '/readiness',
   '/liveness',
   '/metrics',
-  '/favicon.ico',
 ]
+
+/** 构建默认排除路径列表 */
+function buildDefaultExcludePaths(pathPrefix?: string): (string | RegExp)[] {
+  const paths: (string | RegExp)[] = [
+    '/',  // 根路径（LB/K8s 探测）
+    '/favicon.ico',
+  ]
+  
+  if (pathPrefix) {
+    // 有前缀时，精确匹配前缀+后缀
+    DEFAULT_EXCLUDE_SUFFIXES.forEach(suffix => {
+      paths.push(pathPrefix + suffix)
+    })
+  } else {
+    // 无前缀时，使用正则匹配任意前缀
+    DEFAULT_EXCLUDE_SUFFIXES.forEach(suffix => {
+      paths.push(new RegExp(`${suffix}$`))
+    })
+  }
+  
+  return paths
+}
 
 /** 请求日志配置 */
 export interface RequestLoggerOptions {
@@ -121,6 +142,8 @@ export interface RequestLoggerOptions {
   sampleRate?: number
   /** 请求 ID 的 header 名称，用于分布式追踪 @default 'x-request-id' */
   requestIdHeader?: string
+  /** 服务路径前缀（如 /authRestfulApi），用于构建默认排除路径 */
+  pathPrefix?: string
 }
 
 // ============ Circuit Breaker ============
@@ -261,11 +284,13 @@ export function requestLogger(options: RequestLoggerOptions) {
     stdout: stdoutConfig,
     sampleRate = 1,
     requestIdHeader = 'x-request-id',
+    pathPrefix,
   } = options
 
   // 合并默认排除路径
+  const defaultPaths = buildDefaultExcludePaths(pathPrefix)
   const allExcludePaths = useDefaultExcludePaths
-    ? [...DEFAULT_EXCLUDE_PATHS, ...excludePaths]
+    ? [...defaultPaths, ...excludePaths]
     : excludePaths
 
   // 创建熔断器和错误节流器实例

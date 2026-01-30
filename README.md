@@ -45,13 +45,26 @@ server.use(requestLogger({
 | `useDefaultExcludePaths` | `boolean` | 否 | `true` | 是否使用默认排除路径 |
 | `sampleRate` | `number` | 否 | `1` | 日志采样率 (0-1)，1 = 全部，0.1 = 10% |
 | `requestIdHeader` | `string` | 否 | `'x-request-id'` | Request ID 的 header 名称 |
+| `pathPrefix` | `string` | 否 | - | 服务路径前缀，用于构建默认排除路径 |
 
 ### 默认排除路径
 
 以下路径默认不记录日志（可通过 `useDefaultExcludePaths: false` 关闭）：
 
 ```
-/health, /healthz, /ready, /readiness, /liveness, /metrics, /favicon.ico
+/                    # 根路径（LB/K8s 探测）
+/favicon.ico
+{pathPrefix}/health, /healthz, /ready, /readiness, /liveness, /metrics
+```
+
+**推荐**：设置 `pathPrefix` 以精确匹配服务路径：
+
+```typescript
+requestLogger({
+  url: '...',
+  service: 'auth-server',
+  pathPrefix: '/authRestfulApi',  // ← 自动排除 /authRestfulApi/health 等
+})
 ```
 
 ### 熔断器配置 (Circuit Breaker)
