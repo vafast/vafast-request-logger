@@ -68,6 +68,18 @@ export interface ErrorThrottleConfig {
   interval?: number
 }
 
+/** stdout 双写配置 */
+export interface StdoutConfig {
+  /** 是否启用 stdout 输出 @default false */
+  enabled?: boolean
+  /** 输出格式 @default 'json' */
+  format?: 'json' | 'text'
+  /** 是否包含响应体（可能很大）@default false */
+  includeResponse?: boolean
+  /** 是否包含请求体 @default false */
+  includeBody?: boolean
+}
+
 /** 请求日志配置 */
 export interface RequestLoggerOptions {
   /** 日志服务 URL */
@@ -90,6 +102,8 @@ export interface RequestLoggerOptions {
   circuitBreaker?: CircuitBreakerConfig
   /** 错误节流配置 */
   errorThrottle?: ErrorThrottleConfig
+  /** stdout 双写配置（用于 K8s 日志采集） */
+  stdout?: StdoutConfig
 }
 
 // ============ Circuit Breaker ============
@@ -202,6 +216,7 @@ export function requestLogger(options: RequestLoggerOptions) {
     excludePaths = [],
     circuitBreaker: circuitBreakerConfig,
     errorThrottle: errorThrottleConfig,
+    stdout: stdoutConfig,
   } = options
 
   // 创建熔断器和错误节流器实例
@@ -225,6 +240,7 @@ export function requestLogger(options: RequestLoggerOptions) {
       excludePaths,
       circuitBreaker,
       errorThrottle,
+      stdoutConfig,
     }).catch(() => {
       // 错误已在 recordLog 内部处理，这里静默忽略
     })
@@ -248,6 +264,7 @@ interface RecordLogOptions {
   excludePaths: (string | RegExp)[]
   circuitBreaker: CircuitBreaker
   errorThrottle: ErrorThrottle
+  stdoutConfig?: StdoutConfig
 }
 
 /** 检查路由是否配置了 log: false */
@@ -305,6 +322,7 @@ async function recordLog(
     excludePaths,
     circuitBreaker,
     errorThrottle,
+    stdoutConfig,
   } = options
 
   const reqUrl = new URL(req.url)
@@ -315,11 +333,6 @@ async function recordLog(
 
   // 检查路由是否禁用日志
   if (shouldSkipLog(req.method, path)) return
-
-  // 熔断器检查：如果熔断打开，直接跳过上报
-  if (!circuitBreaker.canRequest()) {
-    return
-  }
 
   // 解析请求体
   let body: unknown = null
@@ -351,6 +364,8 @@ async function recordLog(
   const sanitizedBody = sanitize(body, sanitizeConfig)
   const sanitizedResponseData = sanitize(responseData, sanitizeConfig)
 
+  const duration = Date.now() - startTime
+
   // 构建日志数据（业务字段由 log-server 从 headers 解析）
   const logBody = {
     method: req.method,
@@ -360,10 +375,20 @@ async function recordLog(
     body: sanitizedBody,
     query: Object.fromEntries(reqUrl.searchParams),
     status: response.status,
-    duration: Date.now() - startTime,
+    duration,
     service,
     createdAt: new Date().toISOString(),
     response: sanitizedResponseData, // 直接存储完整响应数据
+  }
+
+  // 双写：输出到 stdout（用于 K8s 日志采集）
+  if (stdoutConfig?.enabled) {
+    writeToStdout(logBody, stdoutConfig)
+  }
+
+  // 熔断器检查：如果熔断打开，直接跳过 HTTP 上报
+  if (!circuitBreaker.canRequest()) {
+    return
   }
 
   // 发送到日志服务
@@ -393,6 +418,46 @@ async function recordLog(
     if (shouldLog) {
       onError(error as Error, { droppedCount })
     }
+  }
+}
+
+/** 输出到 stdout（用于 K8s 日志采集） */
+function writeToStdout(
+  logBody: Record<string, unknown>,
+  config: StdoutConfig
+): void {
+  const { format = 'json', includeResponse = false, includeBody = false } =
+    config
+
+  // 构建精简版日志（避免 stdout 日志过大）
+  const stdoutLog: Record<string, unknown> = {
+    level: 30, // INFO level (pino 格式)
+    time: Date.now(),
+    service: logBody.service,
+    method: logBody.method,
+    path: logBody.path,
+    status: logBody.status,
+    duration: logBody.duration,
+    msg: `${logBody.method} ${logBody.path} ${logBody.status} ${logBody.duration}ms`,
+  }
+
+  // 可选：包含请求体
+  if (includeBody && logBody.body) {
+    stdoutLog.body = logBody.body
+  }
+
+  // 可选：包含响应体
+  if (includeResponse && logBody.response) {
+    stdoutLog.response = logBody.response
+  }
+
+  if (format === 'json') {
+    console.log(JSON.stringify(stdoutLog))
+  } else {
+    // text 格式：更易读
+    console.log(
+      `[${new Date().toISOString()}] ${logBody.method} ${logBody.path} ${logBody.status} ${logBody.duration}ms`
+    )
   }
 }
 

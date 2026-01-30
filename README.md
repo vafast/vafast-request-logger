@@ -70,6 +70,49 @@ requestLogger({
 3. 熔断时间到期：进入半开状态，允许一个请求通过测试
 4. 测试成功：恢复正常；测试失败：继续熔断
 
+### stdout 双写配置 (Dual Write)
+
+同时输出到 stdout，用于 K8s 日志采集（如 TKE + CLS）。即使 log-server 挂了，运维也能从 CLS 查日志。
+
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `stdout.enabled` | `boolean` | `false` | 是否启用 stdout 输出 |
+| `stdout.format` | `'json' \| 'text'` | `'json'` | 输出格式 |
+| `stdout.includeBody` | `boolean` | `false` | 是否包含请求体 |
+| `stdout.includeResponse` | `boolean` | `false` | 是否包含响应体 |
+
+```typescript
+requestLogger({
+  url: 'http://log-server:9005/api/logs/ingest',
+  service: 'auth-server',
+  stdout: {
+    enabled: true,       // 启用双写
+    format: 'json',      // JSON 格式（K8s 友好）
+    includeBody: false,  // 不含请求体（减小日志量）
+    includeResponse: false,
+  },
+})
+```
+
+**stdout 输出格式**（精简版，兼容 pino/K8s）：
+
+```json
+{"level":30,"time":1706123456789,"service":"auth-server","method":"POST","path":"/api/users","status":200,"duration":50,"msg":"POST /api/users 200 50ms"}
+```
+
+**架构图**：
+
+```
+请求进来
+    │
+    ▼
+requestLogger 中间件
+    │
+    ├── stdout（JSON）──▶ K8s 采集 ──▶ CLS/Loki（运维备份）
+    │
+    └── HTTP 推送 ──▶ log-server ──▶ MongoDB ──▶ ones（用户查询）
+```
+
 ### 错误节流配置 (Error Throttle)
 
 避免相同错误刷屏，在一段时间内只打印一次。
@@ -196,6 +239,7 @@ requestLogger({
 ## 特性
 
 - **异步非阻塞**：不影响响应速度
+- **stdout 双写**：同时输出到 stdout，支持 K8s 日志采集
 - **熔断器**：日志服务故障时自动熔断，避免雪崩
 - **错误节流**：相同错误不刷屏，带统计计数
 - **路径排除**：支持精确匹配、前缀匹配、正则匹配
@@ -217,10 +261,17 @@ server.use(requestLogger({
   timeout: 5000,
   enabled: true,
   excludePaths: ['/health', '/verifyApiKey'],
+  // stdout 双写（K8s 日志采集）
+  stdout: {
+    enabled: true,
+    format: 'json',
+  },
+  // 熔断器
   circuitBreaker: {
     failureThreshold: 5,
     resetTimeout: 60000,
   },
+  // 错误节流
   errorThrottle: {
     interval: 60000,
   },
