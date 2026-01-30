@@ -41,31 +41,9 @@ server.use(requestLogger({
 | `sanitize` | `SanitizeConfig` | 否 | - | 敏感数据清洗配置 |
 | `onError` | `(err, ctx) => void` | 否 | 内置智能处理 | 错误回调，`ctx.droppedCount` 为被节流忽略的错误数 |
 | `enabled` | `boolean` | 否 | `true` | 是否启用 |
-| `excludePaths` | `(string \| RegExp)[]` | 否 | `[]` | 排除的路径列表（在默认排除基础上追加） |
-| `useDefaultExcludePaths` | `boolean` | 否 | `true` | 是否使用默认排除路径 |
+| `excludePaths` | `(string \| RegExp)[]` | 否 | `[]` | 排除的路径列表（精确匹配或正则） |
 | `sampleRate` | `number` | 否 | `1` | 日志采样率 (0-1)，1 = 全部，0.1 = 10% |
 | `requestIdHeader` | `string` | 否 | `'x-request-id'` | Request ID 的 header 名称 |
-| `pathPrefix` | `string` | 否 | - | 服务路径前缀，用于构建默认排除路径 |
-
-### 默认排除路径
-
-以下路径默认不记录日志（可通过 `useDefaultExcludePaths: false` 关闭）：
-
-```
-/                    # 根路径（LB/K8s 探测）
-/favicon.ico
-{pathPrefix}/health, /healthz, /ready, /readiness, /liveness, /metrics
-```
-
-**推荐**：设置 `pathPrefix` 以精确匹配服务路径：
-
-```typescript
-requestLogger({
-  url: '...',
-  service: 'auth-server',
-  pathPrefix: '/authRestfulApi',  // ← 自动排除 /authRestfulApi/health 等
-})
-```
 
 ### 熔断器配置 (Circuit Breaker)
 
@@ -301,7 +279,6 @@ requestLogger({
 - **智能日志级别**：根据状态码自动设置 INFO/WARN/ERROR
 - **熔断器**：日志服务故障时自动熔断，避免雪崩
 - **错误节流**：相同错误不刷屏，带统计计数
-- **默认排除健康检查**：`/health`、`/metrics` 等路径默认不记录
 - **路径排除**：支持精确匹配、前缀匹配、正则匹配
 - **日志采样**：高流量场景下只记录部分请求
 - **客户端 IP 提取**：自动从 X-Forwarded-For 等获取真实 IP

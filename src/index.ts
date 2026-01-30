@@ -80,37 +80,6 @@ export interface StdoutConfig {
   includeResponse?: boolean
 }
 
-/** 默认排除的路径后缀（健康检查等） */
-const DEFAULT_EXCLUDE_SUFFIXES = [
-  '/health',
-  '/healthz',
-  '/ready',
-  '/readiness',
-  '/liveness',
-  '/metrics',
-]
-
-/** 构建默认排除路径列表 */
-function buildDefaultExcludePaths(pathPrefix?: string): (string | RegExp)[] {
-  const paths: (string | RegExp)[] = [
-    '/',  // 根路径（LB/K8s 探测）
-    '/favicon.ico',
-  ]
-  
-  if (pathPrefix) {
-    // 有前缀时，精确匹配前缀+后缀
-    DEFAULT_EXCLUDE_SUFFIXES.forEach(suffix => {
-      paths.push(pathPrefix + suffix)
-    })
-  } else {
-    // 无前缀时，使用正则匹配任意前缀
-    DEFAULT_EXCLUDE_SUFFIXES.forEach(suffix => {
-      paths.push(new RegExp(`${suffix}$`))
-    })
-  }
-  
-  return paths
-}
 
 /** 请求日志配置 */
 export interface RequestLoggerOptions {
@@ -130,8 +99,6 @@ export interface RequestLoggerOptions {
   enabled?: boolean
   /** 排除的路径列表（精确匹配或正则），这些路径不记录日志 */
   excludePaths?: (string | RegExp)[]
-  /** 是否使用默认排除路径（/health, /metrics 等）@default true */
-  useDefaultExcludePaths?: boolean
   /** 熔断器配置 */
   circuitBreaker?: CircuitBreakerConfig
   /** 错误节流配置 */
@@ -142,8 +109,6 @@ export interface RequestLoggerOptions {
   sampleRate?: number
   /** 请求 ID 的 header 名称，用于分布式追踪 @default 'x-request-id' */
   requestIdHeader?: string
-  /** 服务路径前缀（如 /authRestfulApi），用于构建默认排除路径 */
-  pathPrefix?: string
 }
 
 // ============ Circuit Breaker ============
@@ -278,20 +243,12 @@ export function requestLogger(options: RequestLoggerOptions) {
     onError = defaultOnError,
     enabled = true,
     excludePaths = [],
-    useDefaultExcludePaths = true,
     circuitBreaker: circuitBreakerConfig,
     errorThrottle: errorThrottleConfig,
     stdout: stdoutConfig,
     sampleRate = 1,
     requestIdHeader = 'x-request-id',
-    pathPrefix,
   } = options
-
-  // 合并默认排除路径
-  const defaultPaths = buildDefaultExcludePaths(pathPrefix)
-  const allExcludePaths = useDefaultExcludePaths
-    ? [...defaultPaths, ...excludePaths]
-    : excludePaths
 
   // 创建熔断器和错误节流器实例
   const circuitBreaker = new CircuitBreaker(circuitBreakerConfig)
@@ -316,7 +273,7 @@ export function requestLogger(options: RequestLoggerOptions) {
       timeout,
       sanitizeConfig,
       onError,
-      excludePaths: allExcludePaths,
+      excludePaths,
       circuitBreaker,
       errorThrottle,
       stdoutConfig,
