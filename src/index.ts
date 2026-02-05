@@ -408,14 +408,20 @@ async function recordLog(
   if (shouldSkipLog(req.method, path)) return
 
   // 解析请求体
+  // 注意：只有 POST/PUT/PATCH 等请求才有 body，GET/HEAD 请求即使带有 Content-Type header 也不应尝试解析
+  // 这是 HTTP 规范的惯例，参考 Fastify: "for GET and HEAD requests, the payload is never parsed"
+  // 如果对 GET 请求调用 req.json()，可能导致流读取异常
   let body: unknown = null
-  try {
-    const contentType = req.headers.get('content-type') || ''
-    if (contentType.includes('application/json')) {
-      body = await req.clone().json()
+  const methodsWithBody = ['POST', 'PUT', 'PATCH', 'DELETE']
+  if (methodsWithBody.includes(req.method)) {
+    try {
+      const contentType = req.headers.get('content-type') || ''
+      if (contentType.includes('application/json')) {
+        body = await req.clone().json()
+      }
+    } catch {
+      // 忽略解析错误（如空 body、无效 JSON 等）
     }
-  } catch {
-    // 忽略
   }
 
   // 解析响应体

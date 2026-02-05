@@ -580,6 +580,211 @@ describe('Request ID 提取', () => {
   })
 })
 
+/**
+ * GET/HEAD 请求 body 解析防御测试
+ * 
+ * 背景：某些客户端（如 Electron/浏览器）可能会为 GET 请求添加 Content-Type: application/json header
+ * 中间件不应该尝试解析 GET/HEAD 请求的 body，因为这可能导致流读取异常
+ * 
+ * 参考：Fastify 文档 "for GET and HEAD requests, the payload is never parsed"
+ */
+describe('GET/HEAD 请求 body 解析防御', () => {
+  let fetchMock: ReturnType<typeof vi.fn>
+
+  beforeEach(() => {
+    fetchMock = vi.fn().mockResolvedValue({ ok: true })
+    vi.stubGlobal('fetch', fetchMock)
+  })
+
+  afterEach(() => {
+    vi.unstubAllGlobals()
+  })
+
+  it('GET 请求不应该尝试解析 body（即使有 Content-Type header）', async () => {
+    const middleware = requestLogger({
+      url: 'http://log-server/api/logs',
+      service: 'test-service',
+    })
+
+    const mockResponse = new Response('{}', { status: 200 })
+    const mockNext = vi.fn().mockResolvedValue(mockResponse)
+    
+    // 模拟 Electron 发送带 Content-Type 的 GET 请求
+    const mockReq = new Request('http://example.com/api/data', {
+      method: 'GET',
+      headers: { 'Content-Type': 'application/json' },
+    })
+
+    // 这不应该抛出错误
+    const result = await middleware(mockReq, mockNext)
+    expect(result).toBe(mockResponse)
+
+    // 等待日志异步操作
+    await new Promise((r) => setTimeout(r, 50))
+
+    // 验证日志中 body 应该是 null
+    const [, options] = fetchMock.mock.calls[0]
+    const logBody = JSON.parse(options.body)
+    expect(logBody.body).toBeNull()
+  })
+
+  it('HEAD 请求不应该尝试解析 body', async () => {
+    const middleware = requestLogger({
+      url: 'http://log-server/api/logs',
+      service: 'test-service',
+    })
+
+    const mockResponse = new Response(null, { status: 200 })
+    const mockNext = vi.fn().mockResolvedValue(mockResponse)
+    
+    const mockReq = new Request('http://example.com/api/data', {
+      method: 'HEAD',
+      headers: { 'Content-Type': 'application/json' },
+    })
+
+    const result = await middleware(mockReq, mockNext)
+    expect(result).toBe(mockResponse)
+
+    await new Promise((r) => setTimeout(r, 50))
+
+    const [, options] = fetchMock.mock.calls[0]
+    const logBody = JSON.parse(options.body)
+    expect(logBody.body).toBeNull()
+  })
+
+  it('POST 请求应该正常解析 JSON body', async () => {
+    const middleware = requestLogger({
+      url: 'http://log-server/api/logs',
+      service: 'test-service',
+    })
+
+    const mockResponse = new Response('{}', { status: 200 })
+    const mockNext = vi.fn().mockResolvedValue(mockResponse)
+    
+    const mockReq = new Request('http://example.com/api/data', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message: 'hello' }),
+    })
+
+    await middleware(mockReq, mockNext)
+    await new Promise((r) => setTimeout(r, 50))
+
+    const [, options] = fetchMock.mock.calls[0]
+    const logBody = JSON.parse(options.body)
+    expect(logBody.body).toEqual({ message: 'hello' })
+  })
+
+  it('PUT 请求应该正常解析 JSON body', async () => {
+    const middleware = requestLogger({
+      url: 'http://log-server/api/logs',
+      service: 'test-service',
+    })
+
+    const mockResponse = new Response('{}', { status: 200 })
+    const mockNext = vi.fn().mockResolvedValue(mockResponse)
+    
+    const mockReq = new Request('http://example.com/api/data/1', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id: 1, name: 'updated' }),
+    })
+
+    await middleware(mockReq, mockNext)
+    await new Promise((r) => setTimeout(r, 50))
+
+    const [, options] = fetchMock.mock.calls[0]
+    const logBody = JSON.parse(options.body)
+    expect(logBody.body).toEqual({ id: 1, name: 'updated' })
+  })
+
+  it('PATCH 请求应该正常解析 JSON body', async () => {
+    const middleware = requestLogger({
+      url: 'http://log-server/api/logs',
+      service: 'test-service',
+    })
+
+    const mockResponse = new Response('{}', { status: 200 })
+    const mockNext = vi.fn().mockResolvedValue(mockResponse)
+    
+    const mockReq = new Request('http://example.com/api/data/1', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: 'patched' }),
+    })
+
+    await middleware(mockReq, mockNext)
+    await new Promise((r) => setTimeout(r, 50))
+
+    const [, options] = fetchMock.mock.calls[0]
+    const logBody = JSON.parse(options.body)
+    expect(logBody.body).toEqual({ name: 'patched' })
+  })
+
+  it('DELETE 请求应该正常解析 JSON body（如果有）', async () => {
+    const middleware = requestLogger({
+      url: 'http://log-server/api/logs',
+      service: 'test-service',
+    })
+
+    const mockResponse = new Response('{}', { status: 200 })
+    const mockNext = vi.fn().mockResolvedValue(mockResponse)
+    
+    const mockReq = new Request('http://example.com/api/data/1', {
+      method: 'DELETE',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ reason: '不再需要' }),
+    })
+
+    await middleware(mockReq, mockNext)
+    await new Promise((r) => setTimeout(r, 50))
+
+    const [, options] = fetchMock.mock.calls[0]
+    const logBody = JSON.parse(options.body)
+    expect(logBody.body).toEqual({ reason: '不再需要' })
+  })
+
+  it('GET 请求应该正常记录其他元数据（不受 body 解析跳过影响）', async () => {
+    const middleware = requestLogger({
+      url: 'http://log-server/api/logs',
+      service: 'test-service',
+    })
+
+    const mockResponse = new Response(JSON.stringify({ data: [1, 2, 3] }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    })
+    const mockNext = vi.fn().mockResolvedValue(mockResponse)
+    
+    const mockReq = new Request('http://example.com/api/items?page=1&limit=10', {
+      method: 'GET',
+      headers: {
+        'Content-Type': 'application/json',
+        'User-Agent': 'TestClient/1.0',
+        'app-id': 'test-app',
+      },
+    })
+
+    await middleware(mockReq, mockNext)
+    await new Promise((r) => setTimeout(r, 50))
+
+    // 验证发送到日志服务的完整日志数据
+    const [, options] = fetchMock.mock.calls[0]
+    const logBody = JSON.parse(options.body)
+    
+    expect(logBody.method).toBe('GET')
+    expect(logBody.path).toBe('/api/items')
+    expect(logBody.status).toBe(200)
+    expect(logBody.query).toEqual({ page: '1', limit: '10' })
+    expect(logBody.headers['user-agent']).toBe('TestClient/1.0')
+    expect(logBody.headers['app-id']).toBe('test-app')
+    // body 应该是 null（GET 请求不解析 body）
+    expect(logBody.body).toBeNull()
+    // response 应该正常记录
+    expect(logBody.response).toEqual({ data: [1, 2, 3] })
+  })
+})
+
 describe('日志采样 (sampleRate)', () => {
   let fetchMock: ReturnType<typeof vi.fn>
 
