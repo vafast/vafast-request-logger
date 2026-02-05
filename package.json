@@ -1,6 +1,6 @@
 {
   "name": "@vafast/request-logger",
-  "version": "0.4.6",
+  "version": "0.4.7",
   "description": "API request logging middleware for Vafast",
   "type": "module",
   "main": "./dist/index.mjs",
