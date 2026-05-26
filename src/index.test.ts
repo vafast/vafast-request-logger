@@ -195,6 +195,33 @@ describe('requestLogger', () => {
     expect(body.response).toBe('success')
   })
 
+  it('业务处理消费 JSON body 后仍应该记录请求体', async () => {
+    const middleware = requestLogger({
+      url: 'http://log-server/api/logs',
+      service: 'test-service',
+    })
+
+    const mockReq = new Request('http://example.com/api/users', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: 'test' }),
+    })
+    const mockNext = vi.fn(async () => {
+      await mockReq.json()
+      return new Response(JSON.stringify({ success: true }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      })
+    })
+
+    await middleware(mockReq, mockNext)
+    await new Promise((r) => setTimeout(r, 50))
+
+    const [, options] = fetchMock.mock.calls[0]
+    const body = JSON.parse(options.body)
+    expect(body.body).toEqual({ name: 'test' })
+  })
+
   it('应该记录 form-urlencoded 请求体', async () => {
     const middleware = requestLogger({
       url: 'http://log-server/api/logs',
@@ -228,6 +255,44 @@ describe('requestLogger', () => {
       trade_status: 'TRADE_SUCCESS',
       tag: ['a', 'b'],
     })
+  })
+
+  it('业务处理消费 form-urlencoded body 后仍应该记录请求体并提取业务上下文', async () => {
+    const middleware = requestLogger({
+      url: 'http://log-server/api/logs',
+      service: 'test-service',
+      getAppId: ({ body }) => {
+        const data = body as Record<string, string>
+        return data.out_trade_no === 'order123' ? 'app-from-order' : undefined
+      },
+    })
+
+    const mockReq = new Request('http://example.com/api/notify', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams([
+        ['out_trade_no', 'order123'],
+        ['trade_status', 'TRADE_SUCCESS'],
+      ]),
+    })
+    const mockNext = vi.fn(async () => {
+      await mockReq.formData()
+      return new Response('success', {
+        status: 200,
+        headers: { 'Content-Type': 'text/plain' },
+      })
+    })
+
+    await middleware(mockReq, mockNext)
+    await new Promise((r) => setTimeout(r, 50))
+
+    const [, options] = fetchMock.mock.calls[0]
+    const body = JSON.parse(options.body)
+    expect(body.body).toEqual({
+      out_trade_no: 'order123',
+      trade_status: 'TRADE_SUCCESS',
+    })
+    expect(body.appId).toBe('app-from-order')
   })
 
   it('HTTP 请求失败时应该调用 onError 并带 droppedCount', async () => {

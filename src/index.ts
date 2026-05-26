@@ -281,13 +281,23 @@ export function requestLogger(options: RequestLoggerOptions) {
   return defineMiddleware(async (req, next) => {
     if (!enabled) return next()
 
-    const startTime = Date.now()
-    const response = await next()
+    const reqUrl = new URL(req.url)
+    const path = reqUrl.pathname
+
+    // 这些判断必须发生在读取 body 前，避免无日志路由产生额外开销。
+    if (isPathExcluded(path, excludePaths)) return next()
+    if (shouldSkipLog(req.method, path)) return next()
 
     // 日志采样：随机跳过部分请求
     if (sampleRate < 1 && Math.random() > sampleRate) {
-      return response
+      return next()
     }
+
+    // Fetch Request body 是一次性流。必须在业务处理前用 clone 读取，
+    // 否则路由/框架消费 body 后，日志侧只能读到空 body。
+    const requestBody = await parseRequestBody(req)
+    const startTime = Date.now()
+    const response = await next()
 
     // 异步记录日志，不阻塞响应
     recordLog(req, response, startTime, {
@@ -297,7 +307,6 @@ export function requestLogger(options: RequestLoggerOptions) {
       timeout,
       sanitizeConfig,
       onError,
-      excludePaths,
       circuitBreaker,
       errorThrottle,
       stdoutConfig,
@@ -305,6 +314,7 @@ export function requestLogger(options: RequestLoggerOptions) {
       getAppId,
       getUserId,
       getAuthType,
+      requestBody,
     }).catch(() => {
       // 错误已在 recordLog 内部处理，这里静默忽略
     })
@@ -325,7 +335,6 @@ interface RecordLogOptions {
   timeout: number
   sanitizeConfig?: SanitizeConfig
   onError: (error: Error, context: { droppedCount: number }) => void
-  excludePaths: (string | RegExp)[]
   circuitBreaker: CircuitBreaker
   errorThrottle: ErrorThrottle
   stdoutConfig?: StdoutConfig
@@ -333,6 +342,7 @@ interface RecordLogOptions {
   getAppId?: ContextGetter
   getUserId?: ContextGetter
   getAuthType?: ContextGetter
+  requestBody: unknown
 }
 
 /** 检查路由是否配置了 log: false */
@@ -536,7 +546,6 @@ async function recordLog(
     timeout,
     sanitizeConfig,
     onError,
-    excludePaths,
     circuitBreaker,
     errorThrottle,
     stdoutConfig,
@@ -544,18 +553,12 @@ async function recordLog(
     getAppId,
     getUserId,
     getAuthType,
+    requestBody,
   } = options
 
   const reqUrl = new URL(req.url)
   const path = reqUrl.pathname
-
-  // 检查路径是否在排除列表中
-  if (isPathExcluded(path, excludePaths)) return
-
-  // 检查路由是否禁用日志
-  if (shouldSkipLog(req.method, path)) return
-
-  const body = await parseRequestBody(req)
+  const body = requestBody
 
   // 解析响应体
   const responseData: ResponseData = await parseResponseBody(response)

@@ -23,10 +23,18 @@ server.use(requestLogger({
 **开箱即用特性**：
 - ✅ stdout 双写（K8s 友好）
 - ✅ 智能日志级别（2xx→INFO，4xx→WARN，5xx→ERROR）
-- ✅ 默认排除 `/health`、`/metrics` 等
 - ✅ 自动提取客户端 IP
 - ✅ 自动读取 Request ID
+- ✅ 自动提取 appId、认证类型和 userId
+- ✅ 支持 JSON、表单、文本等请求体
 - ✅ 智能错误处理（节流 + 结构化输出）
+
+## 行为保证
+
+- **不影响业务请求**：日志上报是异步执行的，HTTP 上报失败只会触发熔断、节流和 `onError`，不会让业务接口失败。
+- **不消费业务请求体**：中间件会在业务路由执行前通过 `Request.clone()` 捕获请求体，业务代码仍可正常调用 `req.json()`、`req.formData()` 或 `req.text()`。
+- **失败隔离**：请求体解析失败会记录为 `null`，不会阻断 `next()`；日志服务不可用时会自动熔断，避免持续等待。
+- **先过滤后读取 body**：`enabled=false`、`excludePaths`、`log:false` 和采样跳过的请求不会读取请求体，也不会上报。
 
 ## 配置
 
@@ -44,6 +52,9 @@ server.use(requestLogger({
 | `excludePaths` | `(string \| RegExp)[]` | 否 | `[]` | 排除的路径列表（精确匹配或正则） |
 | `sampleRate` | `number` | 否 | `1` | 日志采样率 (0-1)，1 = 全部，0.1 = 10% |
 | `requestIdHeader` | `string` | 否 | `'x-request-id'` | Request ID 的 header 名称 |
+| `getAppId` | `(ctx) => string \| Promise<string>` | 否 | - | 自定义 appId 提取逻辑 |
+| `getUserId` | `(ctx) => string \| Promise<string>` | 否 | - | 自定义 userId 提取逻辑 |
+| `getAuthType` | `(ctx) => string \| Promise<string>` | 否 | - | 自定义认证类型提取逻辑 |
 
 ### 熔断器配置 (Circuit Breaker)
 
@@ -203,6 +214,38 @@ requestLogger({
 }
 ```
 
+## 请求体捕获
+
+中间件支持以下请求体类型：
+
+| Content-Type | 记录格式 |
+|--------------|----------|
+| `application/json` | JSON 对象 |
+| `application/x-www-form-urlencoded` | 表单对象，重复 key 记录为数组 |
+| `multipart/form-data` | 表单对象；文件只记录 `name`、`type`、`size` |
+| `text/plain` | 字符串 |
+| `application/xml` / `text/xml` | 字符串 |
+| `application/graphql` | 字符串 |
+
+```typescript
+server.use(requestLogger({
+  url: 'http://log-server:9005/api/logs/ingest',
+  service: 'billing-server',
+  getAppId: async ({ path, body }) => {
+    if (path !== '/billingRestfulApi/pointsRecharge/notify/alipay') return undefined
+
+    const form = body as Record<string, string>
+    const orderId = form.out_trade_no
+    if (!orderId) return undefined
+
+    const order = await pointsRechargeOrder.findOne({ _id: orderId })
+    return order?.appId
+  },
+}))
+```
+
+`getAppId`、`getUserId`、`getAuthType` 会收到已解析的请求体和响应数据，适合支付回调这类没有用户登录态、但可以通过订单号反查租户的场景。
+
 ## 日志数据格式
 
 发送到日志服务的数据结构：
@@ -218,6 +261,12 @@ requestLogger({
   status: 200,
   duration: 50,
   service: 'my-service',
+  appId: 'app_123',
+  authType: 'jwt',
+  userId: 'user_123',
+  ip: '1.2.3.4',
+  traceId: 'abc-123-def-456',
+  userAgent: 'Mozilla/5.0 ...',
   createdAt: '2024-01-01T00:00:00.000Z',
   response: { success: true, message: 'OK' },
   clientIp: '1.2.3.4',           // 可选：从 X-Forwarded-For 等提取
@@ -285,7 +334,7 @@ requestLogger({
 - **Request ID 支持**：分布式追踪，兼容 `@vafast/request-id`
 - **敏感数据脱敏**：自动清洗密码、Token 等敏感字段
 - **路由级别控制**：可在路由定义中禁用日志
-- **支持多租户**：通过 headers 传递 appId
+- **支持多租户**：通过 `app-id` header 或 `getAppId` 提取 appId
 
 ## 完整示例
 
@@ -323,9 +372,8 @@ server.use(requestLogger({
   headers: { Authorization: 'Bearer ak_xxx:sk_xxx' },
   timeout: 5000,
   enabled: true,
-  // 路径排除（追加到默认排除列表）
+  // 路径排除
   excludePaths: ['/verifyApiKey'],
-  useDefaultExcludePaths: true,  // 使用默认排除（/health 等）
   // 日志采样（高流量场景）
   sampleRate: 1,  // 1 = 100%，0.1 = 10%
   // Request ID header
