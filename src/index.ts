@@ -80,6 +80,21 @@ export interface StdoutConfig {
   includeResponse?: boolean
 }
 
+/** 业务上下文提取参数 */
+export interface RequestLoggerContext {
+  req: Request
+  response: Response
+  method: string
+  url: URL
+  path: string
+  headers: Record<string, string>
+  body: unknown
+  responseData: unknown
+}
+
+type ContextGetter = (
+  context: RequestLoggerContext
+) => string | undefined | Promise<string | undefined>
 
 /** 请求日志配置 */
 export interface RequestLoggerOptions {
@@ -109,6 +124,12 @@ export interface RequestLoggerOptions {
   sampleRate?: number
   /** 请求 ID 的 header 名称，用于分布式追踪 @default 'x-request-id' */
   requestIdHeader?: string
+  /** 自定义 appId 提取逻辑，适用于支付回调等无 app-id header 的请求 */
+  getAppId?: ContextGetter
+  /** 自定义 userId 提取逻辑 */
+  getUserId?: ContextGetter
+  /** 自定义认证类型提取逻辑 */
+  getAuthType?: ContextGetter
 }
 
 // ============ Circuit Breaker ============
@@ -248,6 +269,9 @@ export function requestLogger(options: RequestLoggerOptions) {
     stdout: stdoutConfig,
     sampleRate = 1,
     requestIdHeader = 'x-request-id',
+    getAppId,
+    getUserId,
+    getAuthType,
   } = options
 
   // 创建熔断器和错误节流器实例
@@ -278,6 +302,9 @@ export function requestLogger(options: RequestLoggerOptions) {
       errorThrottle,
       stdoutConfig,
       requestIdHeader,
+      getAppId,
+      getUserId,
+      getAuthType,
     }).catch(() => {
       // 错误已在 recordLog 内部处理，这里静默忽略
     })
@@ -303,6 +330,9 @@ interface RecordLogOptions {
   errorThrottle: ErrorThrottle
   stdoutConfig?: StdoutConfig
   requestIdHeader: string
+  getAppId?: ContextGetter
+  getUserId?: ContextGetter
+  getAuthType?: ContextGetter
 }
 
 /** 检查路由是否配置了 log: false */
@@ -371,11 +401,126 @@ function getRequestId(req: Request, headerName: string): string | undefined {
   return req.headers.get(headerName) ?? undefined
 }
 
+/** 从原始 Authorization 解析认证类型，必须发生在 headers 脱敏前 */
+function getAuthTypeFromHeaders(headers: Record<string, string>): string | undefined {
+  const auth = headers.authorization
+  if (auth?.startsWith('Bearer ak_')) return 'apiKey'
+  if (auth?.startsWith('Bearer eyJ')) return 'jwt'
+  return undefined
+}
+
+/** 从原始 JWT 解析 userId，不验证签名，仅用于日志归属 */
+function getUserIdFromHeaders(headers: Record<string, string>): string | undefined {
+  const auth = headers.authorization
+  if (!auth?.startsWith('Bearer eyJ')) return undefined
+
+  try {
+    const token = auth.slice(7)
+    const parts = token.split('.')
+    if (parts.length !== 3) return undefined
+
+    const payload = JSON.parse(Buffer.from(parts[1], 'base64url').toString())
+    return payload.sub || payload.userId || payload.id || undefined
+  }
+  catch {
+    return undefined
+  }
+}
+
 /** 根据状态码获取日志级别 */
 function getLogLevel(status: number): number {
   if (status >= 500) return 50 // ERROR
   if (status >= 400) return 40 // WARN
   return 30 // INFO
+}
+
+function formDataToObject(formData: FormData): Record<string, unknown> {
+  const result: Record<string, unknown> = {}
+
+  for (const [key, value] of formData.entries()) {
+    const normalizedValue = value instanceof File
+      ? { name: value.name, type: value.type, size: value.size }
+      : value
+    const currentValue = result[key]
+
+    if (currentValue === undefined) {
+      result[key] = normalizedValue
+    }
+    else if (Array.isArray(currentValue)) {
+      currentValue.push(normalizedValue)
+    }
+    else {
+      result[key] = [currentValue, normalizedValue]
+    }
+  }
+
+  return result
+}
+
+async function parseRequestBody(req: Request): Promise<unknown> {
+  const methodsWithBody = ['POST', 'PUT', 'PATCH', 'DELETE']
+  if (!methodsWithBody.includes(req.method)) return null
+
+  const contentType = req.headers.get('content-type') || ''
+  try {
+    if (contentType.includes('application/json')) {
+      return await req.clone().json()
+    }
+
+    if (contentType.includes('application/x-www-form-urlencoded')) {
+      return formDataToObject(await req.clone().formData())
+    }
+
+    if (contentType.includes('multipart/form-data')) {
+      return formDataToObject(await req.clone().formData())
+    }
+
+    if (
+      contentType.includes('text/plain')
+      || contentType.includes('application/xml')
+      || contentType.includes('text/xml')
+      || contentType.includes('application/graphql')
+    ) {
+      return await req.clone().text()
+    }
+  }
+  catch {
+    // 忽略解析错误（如空 body、无效 JSON、无效表单等）
+  }
+
+  return null
+}
+
+async function parseResponseBody(response: Response): Promise<unknown> {
+  const contentType = response.headers.get('content-type') || ''
+
+  try {
+    if (contentType.includes('application/json')) {
+      return await response.clone().json()
+    }
+
+    if (
+      contentType.includes('text/')
+      || contentType.includes('application/xml')
+      || contentType.includes('application/graphql')
+    ) {
+      return await response.clone().text()
+    }
+  }
+  catch {
+    // 忽略（非 JSON/文本响应、流读取失败等）
+  }
+
+  return null
+}
+
+async function resolveContextValue(
+  getter: ContextGetter | undefined,
+  context: RequestLoggerContext,
+  fallback: string | undefined
+): Promise<string | undefined> {
+  if (!getter) return fallback
+  return (await getter(context)) || fallback
 }
 
 async function recordLog(
@@ -396,6 +541,9 @@ async function recordLog(
     errorThrottle,
     stdoutConfig,
     requestIdHeader,
+    getAppId,
+    getUserId,
+    getAuthType,
   } = options
 
   const reqUrl = new URL(req.url)
@@ -407,36 +555,39 @@ async function recordLog(
   // 检查路由是否禁用日志
   if (shouldSkipLog(req.method, path)) return
 
-  // 解析请求体
-  // 注意：只有 POST/PUT/PATCH 等请求才有 body，GET/HEAD 请求即使带有 Content-Type header 也不应尝试解析
-  // 这是 HTTP 规范的惯例，参考 Fastify: "for GET and HEAD requests, the payload is never parsed"
-  // 如果对 GET 请求调用 req.json()，可能导致流读取异常
-  let body: unknown = null
-  const methodsWithBody = ['POST', 'PUT', 'PATCH', 'DELETE']
-  if (methodsWithBody.includes(req.method)) {
-    try {
-      const contentType = req.headers.get('content-type') || ''
-      if (contentType.includes('application/json')) {
-        body = await req.clone().json()
-      }
-    } catch {
-      // 忽略解析错误（如空 body、无效 JSON 等）
-    }
-  }
+  const body = await parseRequestBody(req)
 
   // 解析响应体
-  let responseData: ResponseData = null
-  try {
-    responseData = await response.clone().json()
-  } catch {
-    // 忽略（非 JSON 响应）
-  }
+  const responseData: ResponseData = await parseResponseBody(response)
 
   // 提取请求头
   const headers: Record<string, string> = {}
   req.headers.forEach((value, key) => {
     headers[key] = value
   })
+
+  const context: RequestLoggerContext = {
+    req,
+    response,
+    method: req.method,
+    url: reqUrl,
+    path,
+    headers,
+    body,
+    responseData,
+  }
+
+  const appId = await resolveContextValue(getAppId, context, headers['app-id'])
+  const authType = await resolveContextValue(
+    getAuthType,
+    context,
+    getAuthTypeFromHeaders(headers)
+  )
+  const userId = await resolveContextValue(
+    getUserId,
+    context,
+    getUserIdFromHeaders(headers)
+  )
 
   // 清洗敏感数据
   const sanitizedHeaders = sanitizeHeaders(headers, sanitizeConfig)
@@ -460,6 +611,12 @@ async function recordLog(
     status: response.status,
     duration,
     service,
+    appId: appId ?? null,
+    authType: authType ?? null,
+    userId: userId ?? null,
+    ip: clientIp ?? null,
+    traceId: requestId ?? null,
+    userAgent: headers['user-agent'] ?? null,
     createdAt: new Date().toISOString(),
     response: sanitizedResponseData, // 直接存储完整响应数据
   }

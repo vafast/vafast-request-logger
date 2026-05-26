@@ -119,10 +119,115 @@ describe('requestLogger', () => {
     expect(body.path).toBe('/api/users')
     expect(body.status).toBe(200)
     expect(body.service).toBe('test-service')
+    expect(body.appId).toBe('app123')
+    expect(body.authType).toBeNull()
+    expect(body.userId).toBeNull()
+    expect(body.ip).toBeNull()
+    expect(body.traceId).toBeNull()
+    expect(body.userAgent).toBe('Test Browser')
     expect(body.headers['app-id']).toBe('app123')
     expect(body.headers['user-agent']).toBe('Test Browser')
     expect(body.query).toEqual({ page: '1' })
     expect(body.response).toEqual({ success: true, message: 'OK' })
+  })
+
+  it('应该在 headers 脱敏前提取业务上下文', async () => {
+    const tokenPayload = Buffer.from(JSON.stringify({ sub: 'user123' })).toString('base64url')
+    const token = `eyJhbGciOiJIUzI1NiJ9.${tokenPayload}.signature`
+    const middleware = requestLogger({
+      url: 'http://log-server/api/logs',
+      service: 'test-service',
+    })
+
+    const mockResponse = new Response(JSON.stringify({ success: true }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    })
+    const mockNext = vi.fn().mockResolvedValue(mockResponse)
+    const mockReq = new Request('http://example.com/api/users', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`,
+        'app-id': 'app123',
+      },
+      body: JSON.stringify({ name: 'test' }),
+    })
+
+    await middleware(mockReq, mockNext)
+    await new Promise((r) => setTimeout(r, 50))
+
+    const [, options] = fetchMock.mock.calls[0]
+    const body = JSON.parse(options.body)
+    expect(body.appId).toBe('app123')
+    expect(body.authType).toBe('jwt')
+    expect(body.userId).toBe('user123')
+    expect(body.headers.authorization).not.toContain(token)
+  })
+
+  it('应该支持自定义业务上下文提取', async () => {
+    const middleware = requestLogger({
+      url: 'http://log-server/api/logs',
+      service: 'test-service',
+      getAppId: ({ body }) => {
+        const data = body as Record<string, string>
+        return data.out_trade_no === 'order123' ? 'app-from-order' : undefined
+      },
+    })
+
+    const mockResponse = new Response('success', {
+      status: 200,
+      headers: { 'Content-Type': 'text/plain' },
+    })
+    const mockNext = vi.fn().mockResolvedValue(mockResponse)
+    const mockReq = new Request('http://example.com/api/notify', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams([['out_trade_no', 'order123']]),
+    })
+
+    await middleware(mockReq, mockNext)
+    await new Promise((r) => setTimeout(r, 50))
+
+    const [, options] = fetchMock.mock.calls[0]
+    const body = JSON.parse(options.body)
+    expect(body.appId).toBe('app-from-order')
+    expect(body.response).toBe('success')
+  })
+
+  it('应该记录 form-urlencoded 请求体', async () => {
+    const middleware = requestLogger({
+      url: 'http://log-server/api/logs',
+      service: 'test-service',
+    })
+
+    const mockResponse = new Response(JSON.stringify({ success: true }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    })
+    const mockNext = vi.fn().mockResolvedValue(mockResponse)
+    const mockReq = new Request('http://example.com/api/notify', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams([
+        ['out_trade_no', 'order123'],
+        ['trade_status', 'TRADE_SUCCESS'],
+        ['tag', 'a'],
+        ['tag', 'b'],
+      ]),
+    })
+
+    await middleware(mockReq, mockNext)
+
+    await new Promise((r) => setTimeout(r, 50))
+
+    const [, options] = fetchMock.mock.calls[0]
+    const body = JSON.parse(options.body)
+    expect(body.body).toEqual({
+      out_trade_no: 'order123',
+      trade_status: 'TRADE_SUCCESS',
+      tag: ['a', 'b'],
+    })
   })
 
   it('HTTP 请求失败时应该调用 onError 并带 droppedCount', async () => {
