@@ -1,18 +1,38 @@
 {
   "compilerOptions": {
     "target": "ES2022",
+    "lib": [
+      "ES2022",
+      "DOM",
+      "DOM.Iterable"
+    ],
     "module": "ESNext",
-    "moduleResolution": "bundler",
-    "declaration": true,
-    "declarationMap": true,
+    "moduleResolution": "Bundler",
+    "moduleDetection": "force",
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "verbatimModuleSyntax": true,
     "strict": true,
-    "esModuleInterop": true,
     "skipLibCheck": true,
+    "noEmit": true,
+    "declaration": true,
+    "esModuleInterop": true,
     "forceConsistentCasingInFileNames": true,
-    "outDir": "./dist",
-    "rootDir": "./src"
+    "types": [
+      "node"
+    ]
   },
-  "include": ["src/**/*"],
-  "exclude": ["node_modules", "dist", "example"]
+  "include": [
+    "src/**/*.ts",
+    "src/**/*.tsx",
+    "tsdown.config.ts"
+  ],
+  "exclude": [
+    "node_modules",
+    "dist",
+    "example",
+    "examples",
+    "test/node",
+    "test/**/*.bun.*"
+  ]
 }
-
