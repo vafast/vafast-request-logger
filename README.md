@@ -112,6 +112,18 @@ requestLogger({
 - 高流量用 `sampleRate`；stdout 默认不要带完整 response
 - 支付回调等用 `getAppId` 从 body 反查
 
+## 端字段（Ones App Client）
+
+在 headers 脱敏前读取约定头，并写入 ingest **顶层**字段（log-server 不再从 headers 兜底解析）：
+
+| Header | 顶层字段 | 示例 |
+|--------|----------|------|
+| `client-key` | `clientKey` | `web` / `desktop` / `ios` / `android` |
+| `x-platform` | `platform` | `browser` / `darwin` / `win32` / `linux` / `ios` / `android` |
+| `x-app-version` | `appVersion` | `1.2.3` |
+
+缺失或空串时**不写**该顶层字段（可选，非必填；服务间调用通常没有）。
+
 ## 注意事项
 
 - 上报异步，失败不影响业务响应

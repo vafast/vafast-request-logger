@@ -162,7 +162,41 @@ describe('requestLogger', () => {
     expect(body.appId).toBe('app123')
     expect(body.authType).toBe('jwt')
     expect(body.userId).toBe('user123')
+    expect(body.clientKey).toBeUndefined()
+    expect(body.platform).toBeUndefined()
+    expect(body.appVersion).toBeUndefined()
     expect(body.headers.authorization).not.toContain(token)
+  })
+
+  it('应该在脱敏前解析端字段并写入 ingest 顶层', async () => {
+    const middleware = requestLogger({
+      url: 'http://log-server/api/logs',
+      service: 'test-service',
+    })
+
+    const mockResponse = new Response(JSON.stringify({ success: true }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    })
+    const mockNext = vi.fn().mockResolvedValue(mockResponse)
+    const mockReq = new Request('http://example.com/api/users', {
+      method: 'GET',
+      headers: {
+        'app-id': 'app123',
+        'client-key': 'web',
+        'x-platform': 'browser',
+        'x-app-version': '1.2.3',
+      },
+    })
+
+    await middleware(mockReq, mockNext)
+    await new Promise((r) => setTimeout(r, 50))
+
+    const [, options] = fetchMock.mock.calls[0]
+    const body = JSON.parse(options.body)
+    expect(body.clientKey).toBe('web')
+    expect(body.platform).toBe('browser')
+    expect(body.appVersion).toBe('1.2.3')
   })
 
   it('应该支持自定义业务上下文提取', async () => {

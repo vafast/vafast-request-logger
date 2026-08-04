@@ -38,6 +38,18 @@ export interface RequestData {
   userId?: string
   appId?: string
   authType?: string
+  /**
+   * Ones App Client：web / desktop / ios / android
+   * 用户端可选；服务间调用不带
+   */
+  clientKey?: string
+  /**
+   * 运行时平台：browser / darwin / win32 / linux / ios / android
+   * 用户端可选；服务间调用不带
+   */
+  platform?: string
+  /** 应用版本（用户端可选） */
+  appVersion?: string
   service?: string
   ip?: string
   userAgent?: string
@@ -411,6 +423,14 @@ function getRequestId(req: Request, headerName: string): string | undefined {
   return req.headers.get(headerName) ?? undefined
 }
 
+/** 读取约定请求头；空串视为缺失，统一返回 null */
+function readNonEmptyHeader(headers: Record<string, string>, name: string): string | null {
+  const value = headers[name]
+  if (typeof value !== 'string') return null
+  const trimmed = value.trim()
+  return trimmed || null
+}
+
 /** 从原始 Authorization 解析认证类型，必须发生在 headers 脱敏前 */
 function getAuthTypeFromHeaders(headers: Record<string, string>): string | undefined {
   const auth = headers.authorization
@@ -591,6 +611,10 @@ async function recordLog(
     context,
     getUserIdFromHeaders(headers)
   )
+  // 端字段在脱敏前从约定头解析，作为 ingest 顶层字段（不依赖 log-server 再从 headers 兜底）
+  const clientKey = readNonEmptyHeader(headers, 'client-key')
+  const platform = readNonEmptyHeader(headers, 'x-platform')
+  const appVersion = readNonEmptyHeader(headers, 'x-app-version')
 
   // 清洗敏感数据
   const sanitizedHeaders = sanitizeHeaders(headers, sanitizeConfig)
@@ -603,7 +627,7 @@ async function recordLog(
   const clientIp = getClientIp(req)
   const requestId = getRequestId(req, requestIdHeader)
 
-  // 构建日志数据（业务字段由 log-server 从 headers 解析）
+  // 构建日志数据（业务/端字段均在脱敏前解析后写入顶层）
   const logBody: Record<string, unknown> = {
     method: req.method,
     url: req.url,
@@ -624,7 +648,10 @@ async function recordLog(
     response: sanitizedResponseData, // 直接存储完整响应数据
   }
 
-  // 可选字段（只在有值时添加）
+  // 可选字段（只在有值时添加；端维度仅用户端流量）
+  if (clientKey) logBody.clientKey = clientKey
+  if (platform) logBody.platform = platform
+  if (appVersion) logBody.appVersion = appVersion
   if (clientIp) logBody.clientIp = clientIp
   if (requestId) logBody.requestId = requestId
 
